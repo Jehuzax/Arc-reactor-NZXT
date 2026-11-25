@@ -26,12 +26,15 @@
     liquidRange: [30, 50],   // °C : bocal presque vide -> presque plein
     liquidAlert: 50,         // au-delà, l'eau pulse en rouge
     cpuRange: [50, 89],      // arc gauche (continu, tête ronde) — 7800X3D : ~60-70 °C en usage léger, ~80 °C en jeu
-    gpuRange: [30, 85],      // arc droit (segmenté, tête en losange)
+    gpuRange: [35, 75],      // arc droit (segmenté, tête en losange)
     cpuAlert: 85,
     gpuAlert: 85,
     gpuIdlePower: 60,        // W : en dessous, l'eau est calme
     gpuMaxPower: 220,        // W : eau en pleine ébullition (RX 9070)
-    lens: 0.20,              // verre de montre : étirement vers les bords (0 = plat, 0.22 = très bombé)
+    ramRange: [10, 24],      // Go : anneau vide -> plein (32 Go au total)
+    lensCenter: 0.88,        // verre bombé : grossissement au centre (1 = aucun, 0.8 = fort)
+    lensEdge: 0.15,          // verre bombé : étirement vers les bords (0 = aucun, 0.25 = très fort)
+    lens: 0.20,              // (version de secours sans WebGL) étirement vers les bords
     defaultFps: 30
   };
 
@@ -48,8 +51,8 @@
   /* =====================================================================
      DONNÉES CAM
      ===================================================================== */
-  var state = { cpu: 62, gpu: 40, liq: 38, load: 0.1, gpuPower: 50, ram: 0.4, live: false };
-  var calm  = { cpu: 62, gpu: 40, liq: 38, load: 0.1, gpuPower: 50, ram: 0.4 };
+  var state = { cpu: 62, gpu: 40, liq: 38, load: 0.1, gpuPower: 50, ram: 12, live: false };
+  var calm  = { cpu: 62, gpu: 40, liq: 38, load: 0.1, gpuPower: 50, ram: 12 };
   var TAUS  = { cpu: 4, gpu: 3, liq: 2, load: 1.2, gpuPower: 1, ram: 2 };
 
   function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
@@ -71,7 +74,7 @@
       if (num(g.temperature) !== null) state.gpu = g.temperature;
       if (num(g.power) !== null) state.gpuPower = g.power;
     }
-    if (r && num(r.inUse) !== null && num(r.totalSize) && r.totalSize > 0) state.ram = r.inUse / r.totalSize;
+    if (r && num(r.inUse) !== null) state.ram = r.inUse / 1024;     // Go utilisés
     if (k && num(k.liquidTemperature) !== null) state.liq = k.liquidTemperature;
     state.live = true;
   }
@@ -95,6 +98,18 @@
   function col(th, s, l, a) {
     l = l + (100 - l) * WHITEN * th.w * clamp((l - 15) / 40, 0, 1);
     return "hsla(" + th.h.toFixed(1) + "," + s + "%," + l.toFixed(1) + "%," + clamp(a, 0, 1).toFixed(3) + ")";
+  }
+  // Couleur « thermique » d'une jauge selon sa position : glacier -> ambre -> orange -> rouge
+  var THERMO = [[0.00, [196, 236, 255]], [0.55, [196, 236, 255]], [0.72, [255, 200, 90]], [0.86, [255, 128, 50]], [1.00, [255, 45, 60]]];
+  function thermo(p, dim, a) {
+    p = clamp(p, 0, 1);
+    for (var i = 1; i < THERMO.length; i++) {
+      if (p <= THERMO[i][0]) {
+        var u = (p - THERMO[i - 1][0]) / (THERMO[i][0] - THERMO[i - 1][0]), c0 = THERMO[i - 1][1], c1 = THERMO[i][1];
+        return "rgba(" + [0, 1, 2].map(function (k) { return Math.round(lerp(c0[k], c1[k], u) * dim); }).join(",") + "," + clamp(a, 0, 1).toFixed(3) + ")";
+      }
+    }
+    return "rgba(255,45,60," + a + ")";
   }
   function red(l, a) { return "hsla(358,100%," + l + "%," + clamp(a, 0, 1).toFixed(3) + ")"; }
 
@@ -168,7 +183,7 @@
       state.gpu = 55 + 22 * Math.sin(t / 8 + 1);
       state.liq = 39 + 6 * Math.sin(t / 12);
       state.gpuPower = 130 + 90 * Math.sin(t / 5);
-      state.ram = 0.45 + 0.15 * Math.sin(t / 11);
+      state.ram = 15 + 4 * Math.sin(t / 11);
     }
 
     for (var key in calm) calm[key] += (state[key] - calm[key]) * (1 - Math.exp(-dt / TAUS[key]));
@@ -188,7 +203,7 @@
     updatePeak("gpu", "holdGpu", arcGpu, dt);
 
     // RAM et niveau d'eau
-    ramLit += (clamp(calm.ram, 0, 1) * 24 - ramLit) * (1 - Math.exp(-dt * 2));
+    ramLit += (range01(calm.ram, CONFIG.ramRange) * 24 - ramLit) * (1 - Math.exp(-dt * 2));
     level += (lerp(0.08, 0.92, range01(calm.liq, CONFIG.liquidRange)) * b - level) * (1 - Math.exp(-dt * 1.5));
 
     // Agitation de l'eau = consommation GPU
@@ -283,21 +298,20 @@
 
     // Contenu du bocal (eau + heure) dessiné à part, puis déformé comme à travers un verre bombé
     renderJar(th, b);
-    drawLensed();
-    drawGlass(b);
+    if (!glLens(b)) { drawLensed(); drawGlass(b); }
 
     ctx.globalCompositeOperation = "lighter";
     drawArcCpu(b);
     drawArcGpu(b);
     ctx.globalCompositeOperation = "source-over";
 
-    drawHighlight(b);
+    if (!glOk) drawHighlight(b);
 
     if (showFps) {
       ctx.font = "600 " + (R * 0.05) + "px " + FONT;
       ctx.textAlign = "center"; ctx.textBaseline = "middle";
       ctx.fillStyle = "rgba(255,255,255,0.75)";
-      ctx.fillText(fpsShown + " i/s", cx, cy - R * 0.63);
+      ctx.fillText(fpsShown + " i/s" + (glOk ? " · GL" : " · 2D"), cx, cy - R * 0.63);
     }
     if (!state.live) {
       ctx.font = "600 " + (R * 0.045) + "px " + FONT;
@@ -342,8 +356,8 @@
 
     surfacePath(true);
     var lg = ctx.createLinearGradient(0, sY - R * 0.03, 0, cy + JR * R);
-    lg.addColorStop(0, alertL ? red(55, 0.24 + 0.12 * pA) : col(th, 100, 62, 0.22 * b));
-    lg.addColorStop(1, alertL ? red(35, 0.12) : col(th, 100, 45, 0.08 * b));
+    lg.addColorStop(0, alertL ? red(55, 0.28 + 0.12 * pA) : col(th, 100, 62, 0.32 * b));
+    lg.addColorStop(1, alertL ? red(35, 0.16) : col(th, 100, 45, 0.14 * b));
     ctx.fillStyle = lg;
     ctx.fill();
 
@@ -415,23 +429,27 @@
       function grad(l1, l2, alpha) {
         if (!hasConic) return col(th, 100, l2, alpha);
         var gg = ctx.createConicGradient(a0, cx, cy);
-        gg.addColorStop(0, col(th, 100, l1, alpha * 0.8));
-        gg.addColorStop(Math.max(spanFrac, 0.001), col(th, 100, l2, alpha));
-        gg.addColorStop(Math.min(1, spanFrac + 0.002), col(th, 100, l2, 0));
+        for (var qi = 0; qi <= 10; qi++) {
+          var q = qi / 10;
+          gg.addColorStop(Math.max(spanFrac * q, 0.0005 * qi), thermo(frac * q, lerp(l1 / l2, 1, q) * (l2 / 74), alpha * lerp(0.8, 1, q)));
+        }
+        gg.addColorStop(Math.min(1, spanFrac + 0.002), thermo(frac, 1, 0));
         return gg;
       }
       ctx.strokeStyle = grad(45, 62, 0.16); ctx.lineWidth = gw * 2;
       ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
       ctx.strokeStyle = grad(46, 74, 0.95); ctx.lineWidth = gw;
       ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
-      if (alert) {
-        ctx.strokeStyle = red(55, 0.35 + 0.45 * (0.5 + 0.5 * Math.sin(t * 6))); ctx.lineWidth = gw * 1.1;
+      if (alert) {   // l'arc entier vire au rouge et pulse
+        ctx.strokeStyle = "rgba(255,40,55," + (0.55 + 0.4 * (0.5 + 0.5 * Math.sin(t * 6))) + ")"; ctx.lineWidth = gw * 1.05;
+        ctx.globalCompositeOperation = "source-over";
         ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
+        ctx.globalCompositeOperation = "lighter";
       }
       var hx = cx + Math.cos(aEnd) * rg, hy = cy + Math.sin(aEnd) * rg;
-      ctx.shadowColor = alert ? red(60, 1) : col(th, 100, 65, 1);
+      ctx.shadowColor = thermo(frac, 1, 1);
       ctx.shadowBlur = R * 0.06;
-      ctx.fillStyle = alert ? "hsla(0,100%,88%,1)" : col(th, 100, 92, 1);
+      ctx.fillStyle = "rgba(255,255,255,1)";
       ctx.beginPath(); ctx.arc(hx, hy, gw * (alert ? 0.72 + 0.18 * Math.sin(t * 6) : 0.6), 0, TAU); ctx.fill();
       ctx.shadowBlur = 0;
     }
@@ -456,8 +474,8 @@
         sector(rg - gw, rg + gw, lo, hi);
         ctx.fillStyle = col(th, 100, 60, 0.09 * fill); ctx.fill();
         sector(rg - gw / 2, rg + gw / 2, lo, hi);
-        ctx.fillStyle = alert ? red(lerp(45, 65, rel), (0.55 + 0.4 * pulse) * fill)
-                              : col(th, 100, lerp(46, 74, rel), 0.95 * fill);
+        ctx.fillStyle = alert ? "rgba(255,40,55," + ((0.6 + 0.35 * pulse) * fill) + ")"
+                              : thermo((k + 0.5) / NB, lerp(0.62, 1, rel), 0.95 * fill);
         ctx.fill();
       } else if (ghost > 0.02) {
         sector(rg - gw / 2, rg + gw / 2, lo, hi);
@@ -470,9 +488,9 @@
       var sz = gw * (alert ? 0.82 + 0.18 * Math.sin(t * 6) : 0.72);
       ctx.save();
       ctx.translate(hx, hy); ctx.rotate(aEnd + Math.PI / 4);
-      ctx.shadowColor = alert ? red(60, 1) : col(th, 100, 65, 1);
+      ctx.shadowColor = thermo(frac, 1, 1);
       ctx.shadowBlur = R * 0.06;
-      ctx.fillStyle = alert ? "hsla(0,100%,88%,1)" : col(th, 100, 92, 1);
+      ctx.fillStyle = "rgba(255,255,255,1)";
       ctx.fillRect(-sz / 2, -sz / 2, sz, sz);
       ctx.restore();
     }
@@ -490,8 +508,8 @@
     txt.width = canvas.width; txt.height = canvas.height;
     tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     tctx.clearRect(0, 0, S, S);
-    var size = R * 0.52;
-    var lines = [["400", hh, cy - R * 0.235], ["700", mm, cy + R * 0.25]];
+    var size = R * 0.44;
+    var lines = [["400", hh, cy - R * 0.2], ["700", mm, cy + R * 0.21]];
     tctx.textAlign = "center"; tctx.textBaseline = "middle";
     for (var pass = 0; pass < 3; pass++) {
       for (var i = 0; i < 2; i++) {
@@ -558,7 +576,99 @@
     ctx.restore();
   }
 
-  // 7. Reflet doux sur la vitre (tache lumineuse, pas de trait)
+  // 6b. Verre bombé en WebGL : vraie déformation de lentille, reflet, liseré, légère irisation
+  var glc = document.createElement("canvas"), gl = null, glOk = false, glProg, glTex, glU = {};
+  (function initGL() {
+    try {
+      if (/nogl=1/.test(href)) return;                 // ?nogl=1 : force la version de secours
+      gl = glc.getContext("webgl", { premultipliedAlpha: true, alpha: true, antialias: false });
+      if (!gl) return;
+      var vs = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
+      var fs = [
+        "precision mediump float;",
+        "uniform sampler2D tex; uniform vec2 res; uniform vec2 c; uniform float jr;",
+        "uniform float a; uniform float k; uniform float fade;",
+        "vec4 tx(vec2 q){ return texture2D(tex, q / res); }",
+        "void main(){",
+        "  vec2 p = (gl_FragCoord.xy - c) / jr; float r = length(p);",
+        "  if (r > 1.0) { gl_FragColor = vec4(0.0); return; }",
+        "  float s = a - k * r * r;",                                  // grossi au centre, étiré vers les bords
+        "  vec2 sp = p * s;",
+        "  float ca = 0.006 * r * r * r;",                             // irisation légère sur les bords
+        "  vec4 cr = tx(c + sp * (1.0 + ca) * jr), cg = tx(c + sp * jr), cb = tx(c + sp * (1.0 - ca) * jr);",
+        "  vec4 col = vec4(cr.r, cg.g, cb.b, max(cg.a, max(cr.a, cb.a)));",
+        "  float z = sqrt(max(0.0, 1.0 - r * r * 0.9));",
+        "  vec3 n = normalize(vec3(p * 0.95, z));",
+        "  vec3 L = normalize(vec3(-0.55, 0.62, 0.58));",              // lumière en haut à gauche
+        "  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));",
+        "  float spec = pow(max(dot(n, H), 0.0), 90.0) * 0.40;",       // reflet qui suit la courbure
+        "  float sheen = pow(max(dot(n, L), 0.0), 12.0) * 0.025;",
+        "  float edge = smoothstep(0.86, 1.0, r);",
+        "  float lit = max(0.0, dot(normalize(p + 1e-5), normalize(L.xy)));",
+        "  float rimLight = edge * lit * 0.38;",                       // liseré clair côté lumière
+        "  float dark = 0.6 * smoothstep(0.5, 1.0, r) * smoothstep(0.5, 1.0, r) * (1.0 - 0.6 * lit * edge);",
+        "  col.rgb *= (1.0 - dark);",
+        "  col.a = col.a + (1.0 - col.a) * dark;",                     // assombrit aussi le fond sous le verre
+        "  vec3 glass = vec3(0.80, 0.93, 1.0) * (spec + sheen + rimLight);",
+        "  col.rgb += glass; col.a = min(1.0, col.a + (spec + sheen + rimLight));",
+        "  gl_FragColor = col * fade;",
+        "}"
+      ].join("\n");
+      function sh(type, src) {
+        var o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o);
+        if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o));
+        return o;
+      }
+      glProg = gl.createProgram();
+      gl.attachShader(glProg, sh(gl.VERTEX_SHADER, vs));
+      gl.attachShader(glProg, sh(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(glProg);
+      if (!gl.getProgramParameter(glProg, gl.LINK_STATUS)) throw new Error("link");
+      gl.useProgram(glProg);
+      var buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      var loc = gl.getAttribLocation(glProg, "p");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      glTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, glTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+      ["tex", "res", "c", "jr", "a", "k", "fade"].forEach(function (n) { glU[n] = gl.getUniformLocation(glProg, n); });
+      glOk = true;
+    } catch (e) { glOk = false; }
+  })();
+  function glLens(b) {
+    if (!glOk) return false;
+    try {
+      var W = canvas.width, H = canvas.height;
+      if (glc.width !== W || glc.height !== H) { glc.width = W; glc.height = H; }
+      gl.viewport(0, 0, W, H);
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.bindTexture(gl.TEXTURE_2D, glTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, jar);
+      gl.uniform1i(glU.tex, 0);
+      gl.uniform2f(glU.res, W, H);
+      gl.uniform2f(glU.c, cx * DPR, H - cy * DPR);
+      gl.uniform1f(glU.jr, JR * R * DPR);
+      gl.uniform1f(glU.a, CONFIG.lensCenter);
+      gl.uniform1f(glU.k, CONFIG.lensEdge);
+      gl.uniform1f(glU.fade, b);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(glc, 0, 0);
+      ctx.restore();
+      return true;
+    } catch (e) { glOk = false; return false; }
+  }
+
+  // 7. Reflet doux sur la vitre (version de secours sans WebGL)
   function drawHighlight(b) {
     ctx.save();
     ctx.globalCompositeOperation = "lighter";
