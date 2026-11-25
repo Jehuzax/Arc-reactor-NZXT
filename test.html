@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Reactor Core — Kraken Elite</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;700&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+(function () {
+  "use strict";
+
+  /* =====================================================================
+     RÉGLAGES
+     ===================================================================== */
+  var CONFIG = {
+    liquidRange: [30, 50],   // °C : bocal presque vide -> presque plein
+    liquidAlert: 50,         // au-delà, l'eau pulse en rouge
+    cpuRange: [50, 89],      // arc gauche (continu, tête ronde) — 7800X3D : ~60-70 °C en usage léger, ~80 °C en jeu
+    gpuRange: [35, 75],      // arc droit (segmenté, tête en losange)
+    cpuAlert: 85,
+    gpuAlert: 85,
+    gpuIdlePower: 60,        // W : en dessous, l'eau est calme
+    gpuMaxPower: 220,        // W : eau en pleine ébullition (RX 9070)
+    ramRange: [10, 24],      // Go : anneau vide -> plein (32 Go au total)
+    lensCenter: 0.88,        // verre bombé : grossissement au centre (1 = aucun, 0.8 = fort)
+    lensEdge: 0.15,          // verre bombé : étirement vers les bords (0 = aucun, 0.25 = très fort)
+    lens: 0.20,              // (version de secours sans WebGL) étirement vers les bords
+    defaultFps: 30
+  };
+
+  // Teinte : glacier clair, proche de #c4ecff, avec un léger écart entre les deux jauges
+  var GLACIER  = { h: 200, w: 1.00 };
+  var CPU_TINT = { h: 207, w: 0.85 };   // un peu plus bleuté
+  var GPU_TINT = { h: 193, w: 1.00 };   // un peu plus blanc
+  var WHITEN = 0.72;                    // force du blanchiment des tons lumineux
+
+  var href = location.href;
+  var onKraken = /[?&]kraken=1/.test(href);
+  var SHOW_INFO = true;    // true : affiche les images/s et le mode (GL ou 2D) en haut du bocal
+  var showFps = SHOW_INFO || /fps=1/.test(href);
+
+  /* =====================================================================
+     DONNÉES CAM
+     ===================================================================== */
+  var state = { cpu: 62, gpu: 40, liq: 38, load: 0.1, gpuPower: 50, ram: 12, live: false };
+  var calm  = { cpu: 62, gpu: 40, liq: 38, load: 0.1, gpuPower: 50, ram: 12 };
+  var TAUS  = { cpu: 4, gpu: 3, liq: 2, load: 1.2, gpuPower: 1, ram: 2 };
+
+  function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
+  function pickGpu(gpus) {
+    if (!gpus || !gpus.length) return null;
+    for (var i = 0; i < gpus.length; i++) {
+      if (gpus[i] && /RX|RTX|GTX|Arc/i.test(gpus[i].name || "")) return gpus[i];
+    }
+    return gpus[gpus.length - 1];
+  }
+  function onData(d) {
+    if (!d) return;
+    var c = d.cpus && d.cpus[0], g = pickGpu(d.gpus), r = d.ram, k = d.kraken;
+    if (c) {
+      if (num(c.temperature) !== null) state.cpu = c.temperature;
+      if (num(c.load) !== null) state.load = c.load > 1 ? c.load / 100 : c.load;
+    }
+    if (g) {
+      if (num(g.temperature) !== null) state.gpu = g.temperature;
+      if (num(g.power) !== null) state.gpuPower = g.power;
+    }
+    if (r && num(r.inUse) !== null) state.ram = r.inUse / 1024;     // Go utilisés
+    if (k && num(k.liquidTemperature) !== null) state.liq = k.liquidTemperature;
+    state.live = true;
+  }
+  function attach() {
+    if (!window.nzxt || typeof window.nzxt !== "object") window.nzxt = {};
+    if (!window.nzxt.v1 || typeof window.nzxt.v1 !== "object") window.nzxt.v1 = {};
+    if (window.nzxt.v1.onMonitoringDataUpdate !== onData) window.nzxt.v1.onMonitoringDataUpdate = onData;
+  }
+  attach();
+  setInterval(attach, 1000);
+  window.addEventListener("load", attach);
+
+  /* =====================================================================
+     OUTILS
+     ===================================================================== */
+  var TAU = Math.PI * 2;
+  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function easeOut(x) { return 1 - Math.pow(1 - clamp(x, 0, 1), 3); }
+  function range01(v, r) { return clamp((v - r[0]) / (r[1] - r[0]), 0, 1); }
+  function col(th, s, l, a) {
+    l = l + (100 - l) * WHITEN * th.w * clamp((l - 15) / 40, 0, 1);
+    return "hsla(" + th.h.toFixed(1) + "," + s + "%," + l.toFixed(1) + "%," + clamp(a, 0, 1).toFixed(3) + ")";
+  }
+  // Couleur « thermique » d'une jauge selon sa position : glacier -> ambre -> orange -> rouge
+  var THERMO = [[0.00, [196, 236, 255]], [0.55, [196, 236, 255]], [0.72, [255, 200, 90]], [0.86, [255, 128, 50]], [1.00, [255, 45, 60]]];
+  function thermo(p, dim, a) {
+    p = clamp(p, 0, 1);
+    for (var i = 1; i < THERMO.length; i++) {
+      if (p <= THERMO[i][0]) {
+        var u = (p - THERMO[i - 1][0]) / (THERMO[i][0] - THERMO[i - 1][0]), c0 = THERMO[i - 1][1], c1 = THERMO[i][1];
+        return "rgba(" + [0, 1, 2].map(function (k) { return Math.round(lerp(c0[k], c1[k], u) * dim); }).join(",") + "," + clamp(a, 0, 1).toFixed(3) + ")";
+      }
+    }
+    return "rgba(255,45,60," + a + ")";
+  }
+  function red(l, a) { return "hsla(358,100%," + l + "%," + clamp(a, 0, 1).toFixed(3) + ")"; }
+
+  /* =====================================================================
+     CANVAS
+     ===================================================================== */
+  var canvas = document.getElementById("c");
+  var ctx = canvas.getContext("2d");
+  var S = 640, R = 320, cx = 320, cy = 320, DPR = 1;
+  function resize() {
+    var v1 = window.nzxt.v1;
+    var w = num(v1.width) || window.innerWidth, h = num(v1.height) || window.innerHeight;
+    S = Math.max(100, Math.min(w, h, window.innerWidth, window.innerHeight));
+    DPR = onKraken ? 1 : (window.devicePixelRatio || 1);
+    canvas.width = Math.round(S * DPR); canvas.height = Math.round(S * DPR);
+    canvas.style.width = S + "px"; canvas.style.height = S + "px";
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    R = S / 2; cx = R; cy = R;
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  var FONT = "Oxanium, Bahnschrift, 'Segoe UI', Arial, sans-serif";
+  if (document.fonts && document.fonts.load) {
+    document.fonts.load("400 100px Oxanium");
+    document.fonts.load("700 100px Oxanium");
+  }
+
+  /* =====================================================================
+     GÉOMÉTRIE
+     ===================================================================== */
+  var RG = 0.73, GW = 0.066;               // rayon et épaisseur des jauges (paroi du bocal)
+  var JR = RG - GW / 2 - 0.012;            // rayon intérieur du bocal (l'eau s'arrête là)
+  var GAPB = 0.22, GAPT = 0.12, SPAN = Math.PI - GAPB - GAPT;
+  function angleOf(side, frac) { return Math.PI / 2 + side * (GAPB + SPAN * frac); }
+
+  /* =====================================================================
+     ÉTAT DE L'ANIMATION
+     ===================================================================== */
+  var t = 0, last = performance.now(), lastDraw = 0, startTime = performance.now();
+  var boot = 0;
+  var rotCells = 0, wave = 0;
+  var arcCpu = 0, arcGpu = 0;
+  var peak = { cpu: 0, gpu: 0, holdCpu: 0, holdGpu: 0 };
+  var ramLit = 0, level = 0;
+  var bubbles = [], bubbleAcc = 0, pops = [], drops = [], dropAcc = 0;
+  var agi = 0, ph1 = 0, ph2 = 0, ph3 = 0;
+  var fpsCount = 0, fpsShown = 0, fpsTime = performance.now();
+
+  function updatePeak(key, holdKey, frac, dt) {
+    if (frac >= peak[key]) { peak[key] = frac; peak[holdKey] = 1.8; }
+    else if (peak[holdKey] > 0) peak[holdKey] -= dt;
+    else peak[key] = Math.max(frac, peak[key] - 0.06 * dt);
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var fps = num(window.nzxt.v1.targetFps) || CONFIG.defaultFps;
+    if (now - lastDraw < 1000 / fps - 2) return;
+    lastDraw = now;
+    var dt = Math.min(1, Math.max(0, (now - last) / 1000));
+    last = now;
+    t += dt;
+
+    fpsCount++;
+    if (now - fpsTime >= 1000) { fpsShown = Math.round(fpsCount * 1000 / (now - fpsTime)); fpsCount = 0; fpsTime = now; }
+
+    if (!state.live && (!onKraken || now - startTime > 2000)) {
+      state.load = clamp(0.35 + 0.3 * Math.sin(t / 3.1) * Math.sin(t / 7.3), 0, 1);
+      state.cpu = 70 + 12 * Math.sin(t / 6);
+      state.gpu = 55 + 22 * Math.sin(t / 8 + 1);
+      state.liq = 39 + 6 * Math.sin(t / 12);
+      state.gpuPower = 130 + 90 * Math.sin(t / 5);
+      state.ram = 15 + 4 * Math.sin(t / 11);
+    }
+
+    for (var key in calm) calm[key] += (state[key] - calm[key]) * (1 - Math.exp(-dt / TAUS[key]));
+
+    boot = Math.min(1, boot + dt / 1.8);
+    var b = easeOut(boot);
+    var load = calm.load;
+
+    // Rotation des cellules = charge CPU (plafonnée selon les images/s)
+    rotCells += dt * Math.min(0.06 + load * 0.9, 0.25 * (TAU / 24) * fps);
+    wave += dt * Math.min(1 + load * 3, 0.15 * TAU * fps / 6);
+
+    // Jauges
+    arcCpu += (range01(calm.cpu, CONFIG.cpuRange) * b - arcCpu) * (1 - Math.exp(-dt * 3));
+    arcGpu += (range01(calm.gpu, CONFIG.gpuRange) * b - arcGpu) * (1 - Math.exp(-dt * 3));
+    updatePeak("cpu", "holdCpu", arcCpu, dt);
+    updatePeak("gpu", "holdGpu", arcGpu, dt);
+
+    // RAM et niveau d'eau
+    ramLit += (range01(calm.ram, CONFIG.ramRange) * 24 - ramLit) * (1 - Math.exp(-dt * 2));
+    level += (lerp(0.08, 0.92, range01(calm.liq, CONFIG.liquidRange)) * b - level) * (1 - Math.exp(-dt * 1.5));
+
+    // Agitation de l'eau = consommation GPU
+    var agiTarget = Math.pow(clamp((calm.gpuPower - CONFIG.gpuIdlePower) / (CONFIG.gpuMaxPower - CONFIG.gpuIdlePower), 0, 1), 0.9);
+    agi += (agiTarget - agi) * (1 - Math.exp(-dt / (agiTarget > agi ? 2 : 4)));
+    ph1 += dt * (1.2 + 2.6 * agi);
+    ph2 += dt * (1.7 + 3.4 * agi);
+    ph3 += dt * (2.5 + 5.0 * agi);
+
+    bubbleAcc += dt * (0.35 + 11 * Math.pow(agi, 1.5)) * b;
+    while (bubbleAcc >= 1) {
+      bubbleAcc -= 1;
+      if (bubbles.length < 16) bubbles.push({
+        x: (Math.random() * 2 - 1) * (JR - 0.12), y: JR - 0.04,
+        v: 0.07 + 0.08 * Math.random() + 0.22 * agi,
+        r: (0.005 + 0.007 * Math.random()) * (1 + 1.3 * agi),
+        ph: Math.random() * TAU, wob: 0.006 + 0.012 * agi
+      });
+    }
+    for (var j = bubbles.length - 1; j >= 0; j--) {
+      var bu = bubbles[j];
+      bu.y -= bu.v * dt; bu.ph += dt * (3 + 4 * agi);
+      if (bu.y < surfaceAt(bu.x) + bu.r) {
+        if (pops.length < 12) pops.push({ x: bu.x, life: 0, max: 0.45, r: bu.r });
+        bubbles.splice(j, 1);
+      }
+    }
+    for (var q = pops.length - 1; q >= 0; q--) { pops[q].life += dt; if (pops[q].life > pops[q].max) pops.splice(q, 1); }
+
+    dropAcc += dt * Math.max(0, agi - 0.65) * 18 * b;
+    while (dropAcc >= 1) {
+      dropAcc -= 1;
+      if (drops.length < 10) {
+        var dx0 = (Math.random() * 2 - 1) * (JR - 0.15);
+        drops.push({ x: dx0, y: surfaceAt(dx0), vx: (Math.random() - 0.5) * 0.12, vy: -(0.22 + Math.random() * 0.2), r: 0.005 + Math.random() * 0.004 });
+      }
+    }
+    for (var di = drops.length - 1; di >= 0; di--) {
+      var dr = drops[di];
+      dr.vy += 1.1 * dt; dr.x += dr.vx * dt; dr.y += dr.vy * dt;
+      if (dr.vy > 0 && dr.y > surfaceAt(dr.x)) drops.splice(di, 1);
+    }
+
+    draw(b);
+  }
+
+  /* =====================================================================
+     SURFACE DE L'EAU (unités de R, relatives au centre)
+     ===================================================================== */
+  function surfaceAt(x) {
+    var base = JR - level * 2 * JR;
+    var a1 = 0.006 + 0.026 * agi, a2 = 0.004 + 0.018 * agi, a3 = 0.012 * agi * agi;
+    return base + a1 * Math.sin(x * 9 + ph1) + a2 * Math.sin(x * 15 - ph2) + a3 * Math.sin(x * 31 + ph3);
+  }
+  function surfacePath(close) {
+    ctx.beginPath();
+    var steps = 44;
+    for (var i = 0; i <= steps; i++) {
+      var x = -JR + (2 * JR) * i / steps;
+      var px = cx + x * R, py = cy + surfaceAt(x) * R;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    if (close) { ctx.lineTo(cx + JR * R, cy + R); ctx.lineTo(cx - JR * R, cy + R); ctx.closePath(); }
+  }
+
+  /* =====================================================================
+     DESSIN
+     ===================================================================== */
+  function sector(r1, r2, a1, a2) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, r2, a1, a2);
+    ctx.arc(cx, cy, r1, a2, a1, true);
+    ctx.closePath();
+  }
+
+  function draw(b) {
+    var th = GLACIER;
+    ctx.save();
+    ctx.clearRect(0, 0, S, S);
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.clip();
+
+    var bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
+    bg.addColorStop(0, col(th, 50, 3.5, 1));
+    bg.addColorStop(0.7, col(th, 40, 2.5, 1));
+    bg.addColorStop(1, "#000");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, S, S);
+
+    ctx.globalCompositeOperation = "lighter";
+    drawCells(th);
+    ctx.globalCompositeOperation = "source-over";
+
+    // Contenu du bocal (eau + heure) dessiné à part, puis déformé comme à travers un verre bombé
+    renderJar(th, b);
+    if (!glLens(b)) { drawLensed(); drawGlass(b); }
+
+    ctx.globalCompositeOperation = "lighter";
+    drawArcCpu(b);
+    drawArcGpu(b);
+    ctx.globalCompositeOperation = "source-over";
+
+    if (!glOk) drawHighlight(b);
+
+    if (showFps) {
+      ctx.font = "600 " + (R * 0.05) + "px " + FONT;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(255,255,255,0.75)";
+      ctx.fillText(fpsShown + " i/s" + (glOk ? " · GL" : " · 2D"), cx, cy - R * 0.63);
+    }
+    if (!state.live) {
+      ctx.font = "600 " + (R * 0.045) + "px " + FONT;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(255,255,255," + (0.4 * b) + ")";
+      ctx.fillText("DÉMO", cx, cy + R * 0.63);
+    }
+    ctx.restore();
+  }
+
+  // 1. Cellules = RAM utilisée
+  function drawCells(th) {
+    var NS = 24, gap = 0.04, r1 = R * 0.815, r2 = R * 0.985, lw = Math.max(1.5, R * 0.005);
+    for (var j = 0; j < NS; j++) {
+      var reveal = clamp(boot * (NS + 4) - j, 0, 1);
+      if (reveal <= 0) continue;
+      var s1 = rotCells + j * TAU / NS + gap / 2 - Math.PI / 2;
+      var s2 = rotCells + (j + 1) * TAU / NS - gap / 2 - Math.PI / 2;
+      var fill = clamp(ramLit - j, 0, 1);
+      sector(r1, r2, s1, s2);
+      ctx.fillStyle = col(th, 60, 40, 0.045 * reveal); ctx.fill();
+      ctx.strokeStyle = col(th, 80, 60, 0.12 * reveal); ctx.lineWidth = lw; ctx.stroke();
+      if (fill > 0) {
+        var w = 0.5 + 0.5 * Math.sin(wave - j * TAU / NS * 2);
+        var br = 0.45 + 0.55 * w * w;
+        sector(r1 - R * 0.012, r2 + R * 0.012, s1 - 0.01, s2 + 0.01);
+        ctx.fillStyle = col(th, 100, 60, 0.12 * br * fill * reveal); ctx.fill();
+        sector(r1, r2, s1, s2);
+        ctx.fillStyle = col(th, 100, lerp(40, 66, br), (0.35 + 0.6 * br) * fill * reveal); ctx.fill();
+      }
+    }
+  }
+
+  // 2. Eau : s'étend d'un arc à l'autre ; niveau = liquide, agitation = conso GPU
+  function drawWater(th, b) {
+    var alertL = calm.liq >= CONFIG.liquidAlert;
+    var pA = 0.5 + 0.5 * Math.sin(t * 6);
+    var sY = cy + surfaceAt(0) * R;
+
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, JR * R, 0, TAU); ctx.clip();
+
+    surfacePath(true);
+    var lg = ctx.createLinearGradient(0, sY - R * 0.03, 0, cy + JR * R);
+    lg.addColorStop(0, alertL ? red(55, 0.28 + 0.12 * pA) : col(th, 100, 62, 0.32 * b));
+    lg.addColorStop(1, alertL ? red(35, 0.16) : col(th, 100, 45, 0.14 * b));
+    ctx.fillStyle = lg;
+    ctx.fill();
+
+    ctx.globalCompositeOperation = "lighter";
+    var bubLw = Math.max(1.5, R * 0.004);
+    for (var i = 0; i < bubbles.length; i++) {
+      var bu = bubbles[i];
+      var bx = cx + (bu.x + bu.wob * Math.sin(bu.ph)) * R, by = cy + bu.y * R;
+      ctx.strokeStyle = col(th, 100, 85, 0.5 * b);
+      ctx.lineWidth = bubLw;
+      ctx.beginPath(); ctx.arc(bx, by, bu.r * R, 0, TAU); ctx.stroke();
+    }
+    for (var pi = 0; pi < pops.length; pi++) {
+      var po = pops[pi], pf = po.life / po.max;
+      var px = cx + po.x * R, py = cy + surfaceAt(po.x) * R;
+      ctx.strokeStyle = col(th, 100, 88, 0.6 * (1 - pf) * b);
+      ctx.lineWidth = bubLw;
+      ctx.beginPath(); ctx.ellipse(px, py, (po.r + 0.03 * pf) * R, (po.r * 0.4 + 0.008 * pf) * R, 0, 0, TAU); ctx.stroke();
+    }
+    surfacePath(false);
+    ctx.shadowColor = alertL ? red(60, 1) : col(th, 100, 65, 1);
+    ctx.shadowBlur = R * 0.04;
+    ctx.strokeStyle = alertL ? red(70, 0.6 + 0.4 * pA) : col(th, 100, 85, 0.8 * b);
+    ctx.lineWidth = Math.max(2.5, R * 0.009);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    for (var dk = 0; dk < drops.length; dk++) {
+      var dd = drops[dk];
+      ctx.fillStyle = alertL ? red(75, 0.8) : col(th, 100, 88, 0.8 * b);
+      ctx.beginPath(); ctx.arc(cx + dd.x * R, cy + dd.y * R, Math.max(2, dd.r * R), 0, TAU); ctx.fill();
+    }
+    ctx.restore();
+  }
+
+  // 3. Vitre bombée : bords intérieurs assombris (donne le volume)
+  function drawGlass(b) {
+    var g = ctx.createRadialGradient(cx - R * 0.1, cy - R * 0.12, R * JR * 0.25, cx, cy, R * JR);
+    g.addColorStop(0, "rgba(0,0,0,0)");
+    g.addColorStop(0.62, "rgba(0,0,0,0.08)");
+    g.addColorStop(0.88, "rgba(0,0,0," + (0.32 * b) + ")");
+    g.addColorStop(1, "rgba(0,0,0," + (0.62 * b) + ")");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(cx, cy, JR * R, 0, TAU); ctx.fill();
+  }
+
+  // 4a. Jauge CPU (gauche) : arc continu, tête ronde
+  function trackLines(th, side, b) {
+    var a0 = angleOf(side, 0), a1 = angleOf(side, 1);
+    var lo = Math.min(a0, a1), hi = Math.max(a0, a1), rg = R * RG, gw = R * GW;
+    ctx.strokeStyle = col(th, 90, 70, 0.12 * b);
+    ctx.lineWidth = Math.max(1.5, R * 0.004);
+    ctx.beginPath(); ctx.arc(cx, cy, rg + gw * 0.62, lo, hi); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, rg - gw * 0.62, lo, hi); ctx.stroke();
+  }
+  function drawArcCpu(b) {
+    var th = CPU_TINT, side = +1, rg = R * RG, gw = R * GW, frac = arcCpu;
+    var alert = calm.cpu >= CONFIG.cpuAlert;
+    var a0 = angleOf(side, 0), aEnd = angleOf(side, frac), aFull = angleOf(side, 1), aPk = angleOf(side, peak.cpu);
+    ctx.strokeStyle = col(th, 80, 55, 0.07 * b); ctx.lineWidth = gw;
+    ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aFull); ctx.stroke();
+    trackLines(th, side, b);
+    if (peak.cpu > frac + 0.004) {
+      ctx.strokeStyle = col(th, 100, 70, 0.22 * b); ctx.lineWidth = gw * 0.8;
+      ctx.beginPath(); ctx.arc(cx, cy, rg, aEnd, aPk); ctx.stroke();
+    }
+    if (frac > 0.003) {
+      var spanFrac = (aEnd - a0) / TAU;
+      var hasConic = typeof ctx.createConicGradient === "function";
+      function grad(l1, l2, alpha) {
+        if (!hasConic) return col(th, 100, l2, alpha);
+        var gg = ctx.createConicGradient(a0, cx, cy);
+        for (var qi = 0; qi <= 10; qi++) {
+          var q = qi / 10;
+          gg.addColorStop(Math.max(spanFrac * q, 0.0005 * qi), thermo(frac * q, lerp(l1 / l2, 1, q) * (l2 / 74), alpha * lerp(0.8, 1, q)));
+        }
+        gg.addColorStop(Math.min(1, spanFrac + 0.002), thermo(frac, 1, 0));
+        return gg;
+      }
+      ctx.strokeStyle = grad(45, 62, 0.16); ctx.lineWidth = gw * 2;
+      ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
+      ctx.strokeStyle = grad(46, 74, 0.95); ctx.lineWidth = gw;
+      ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
+      if (alert) {   // l'arc entier vire au rouge et pulse
+        ctx.strokeStyle = "rgba(255,40,55," + (0.55 + 0.4 * (0.5 + 0.5 * Math.sin(t * 6))) + ")"; ctx.lineWidth = gw * 1.05;
+        ctx.globalCompositeOperation = "source-over";
+        ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
+        ctx.globalCompositeOperation = "lighter";
+      }
+      var hx = cx + Math.cos(aEnd) * rg, hy = cy + Math.sin(aEnd) * rg;
+      ctx.shadowColor = thermo(frac, 1, 1);
+      ctx.shadowBlur = R * 0.06;
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.beginPath(); ctx.arc(hx, hy, gw * (alert ? 0.72 + 0.18 * Math.sin(t * 6) : 0.6), 0, TAU); ctx.fill();
+      ctx.shadowBlur = 0;
+    }
+  }
+
+  // 4b. Jauge GPU (droite) : blocs, tête en losange
+  function drawArcGpu(b) {
+    var th = GPU_TINT, side = -1, rg = R * RG, gw = R * GW, frac = arcGpu;
+    var alert = calm.gpu >= CONFIG.gpuAlert;
+    var NB = 18, bgap = 0.02, lw = Math.max(1.5, R * 0.004);
+    var pulse = 0.5 + 0.5 * Math.sin(t * 6);
+    trackLines(th, side, b);
+    for (var k = 0; k < NB; k++) {
+      var a1 = angleOf(side, k / NB) - side * bgap / 2, a2 = angleOf(side, (k + 1) / NB) + side * bgap / 2;
+      var lo = Math.min(a1, a2), hi = Math.max(a1, a2);
+      var fill = clamp(frac * NB - k, 0, 1);
+      var ghost = clamp(peak.gpu * NB - k, 0, 1) - fill;
+      sector(rg - gw / 2, rg + gw / 2, lo, hi);
+      ctx.strokeStyle = col(th, 80, 60, 0.12 * b); ctx.lineWidth = lw; ctx.stroke();
+      if (fill > 0) {
+        var rel = clamp((k + 0.5) / (frac * NB), 0, 1);
+        sector(rg - gw, rg + gw, lo, hi);
+        ctx.fillStyle = col(th, 100, 60, 0.09 * fill); ctx.fill();
+        sector(rg - gw / 2, rg + gw / 2, lo, hi);
+        ctx.fillStyle = alert ? "rgba(255,40,55," + ((0.6 + 0.35 * pulse) * fill) + ")"
+                              : thermo((k + 0.5) / NB, lerp(0.62, 1, rel), 0.95 * fill);
+        ctx.fill();
+      } else if (ghost > 0.02) {
+        sector(rg - gw / 2, rg + gw / 2, lo, hi);
+        ctx.fillStyle = col(th, 100, 70, 0.22 * ghost * b); ctx.fill();
+      }
+    }
+    if (frac > 0.003) {
+      var aEnd = angleOf(side, frac);
+      var hx = cx + Math.cos(aEnd) * rg, hy = cy + Math.sin(aEnd) * rg;
+      var sz = gw * (alert ? 0.82 + 0.18 * Math.sin(t * 6) : 0.72);
+      ctx.save();
+      ctx.translate(hx, hy); ctx.rotate(aEnd + Math.PI / 4);
+      ctx.shadowColor = thermo(frac, 1, 1);
+      ctx.shadowBlur = R * 0.06;
+      ctx.fillStyle = "rgba(255,255,255,1)";
+      ctx.fillRect(-sz / 2, -sz / 2, sz, sz);
+      ctx.restore();
+    }
+  }
+
+  // 5. Heure (mise en cache, redessinée seulement quand la minute change)
+  var txt = document.createElement("canvas"), tctx = txt.getContext("2d"), txtKey = "";
+  function fontReady() { return !!(document.fonts && document.fonts.check && document.fonts.check("700 20px Oxanium")); }
+  function renderText() {
+    var d = new Date();
+    var hh = String(d.getHours()).padStart(2, "0"), mm = String(d.getMinutes()).padStart(2, "0");
+    var key = hh + mm + "|" + canvas.width + "|" + fontReady();
+    if (key === txtKey) return;
+    txtKey = key;
+    txt.width = canvas.width; txt.height = canvas.height;
+    tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    tctx.clearRect(0, 0, S, S);
+    var size = R * 0.44;
+    var lines = [["400", hh, cy - R * 0.2], ["700", mm, cy + R * 0.21]];
+    tctx.textAlign = "center"; tctx.textBaseline = "middle";
+    for (var pass = 0; pass < 3; pass++) {
+      for (var i = 0; i < 2; i++) {
+        tctx.font = lines[i][0] + " " + size + "px " + FONT;
+        if (pass === 0) {        // ombre portée sombre, décalée vers le bas : détache les chiffres de l'eau
+          tctx.shadowColor = "rgba(0,0,0,0.95)"; tctx.shadowBlur = R * 0.05;
+          tctx.shadowOffsetX = 0; tctx.shadowOffsetY = R * 0.02;
+          tctx.fillStyle = "rgba(0,0,0,0.9)";
+        } else if (pass === 1) { // halo glacier
+          tctx.shadowColor = col(GLACIER, 100, 55, 0.9); tctx.shadowBlur = R * 0.045;
+          tctx.shadowOffsetX = 0; tctx.shadowOffsetY = 0;
+          tctx.fillStyle = "#ffffff";
+        } else {                 // chiffres nets par-dessus
+          tctx.shadowColor = "transparent"; tctx.shadowBlur = 0;
+          tctx.fillStyle = "#ffffff";
+        }
+        tctx.fillText(lines[i][1], cx, lines[i][2]);
+      }
+    }
+  }
+
+  // 6. Contenu du bocal + déformation « verre bombé »
+  var jar = document.createElement("canvas"), jctx = jar.getContext("2d");
+  var lensC = document.createElement("canvas"), lctx = lensC.getContext("2d");
+  function renderJar(th, b) {
+    if (jar.width !== canvas.width || jar.height !== canvas.height) {
+      jar.width = lensC.width = canvas.width; jar.height = lensC.height = canvas.height;
+    }
+    jctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    jctx.clearRect(0, 0, S, S);
+    var main = ctx;
+    ctx = jctx;                       // les fonctions de dessin écrivent dans le calque du bocal
+    drawWater(th, b);
+    ctx = main;
+    renderText();
+    jctx.setTransform(1, 0, 0, 1, 0, 0);
+    jctx.globalAlpha = b;
+    jctx.drawImage(txt, 0, 0);
+    jctx.globalAlpha = 1;
+  }
+
+  // Verre de montre, en deux passes (colonnes puis lignes) : le centre reste fidèle,
+  // et l'image s'étire de plus en plus en s'éloignant du centre
+  function lensMap(u) { var k = CONFIG.lens; return Math.max(0.15, 1 - 3 * k * u * u); }   // largeur source par pixel affiché
+  function drawLensed() {
+    var k = CONFIG.lens, C = cx * DPR, Rp = JR * R * DPR, W = canvas.width, H = canvas.height;
+    var st = Math.max(2, Math.round(2 * DPR));
+    var x0 = Math.floor(C - Rp), x1 = Math.ceil(C + Rp);
+    lctx.setTransform(1, 0, 0, 1, 0, 0);
+    lctx.clearRect(0, 0, W, H);
+    for (var x = x0; x < x1; x += st) {
+      var u = clamp((x - C) / Rp, -1, 1);
+      var sx = C + (x - C) * (1 - k * u * u);
+      lctx.drawImage(jar, sx, 0, st * lensMap(u), H, x, 0, st, H);
+    }
+    ctx.save();
+    ctx.beginPath(); ctx.arc(cx, cy, JR * R, 0, TAU); ctx.clip();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    for (var y = x0; y < x1; y += st) {
+      var v = clamp((y - C) / Rp, -1, 1);
+      var sy = C + (y - C) * (1 - k * v * v);
+      ctx.drawImage(lensC, 0, sy, W, st * lensMap(v), 0, y, W, st);
+    }
+    ctx.restore();
+  }
+
+  // 6b. Verre bombé en WebGL : vraie déformation de lentille, reflet, liseré, légère irisation
+  var glc = document.createElement("canvas"), gl = null, glOk = false, glProg, glTex, glU = {};
+  (function initGL() {
+    try {
+      if (/nogl=1/.test(href)) return;                 // ?nogl=1 : force la version de secours
+      gl = glc.getContext("webgl", { premultipliedAlpha: true, alpha: true, antialias: false });
+      if (!gl) return;
+      var vs = "attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }";
+      var fs = [
+        "precision mediump float;",
+        "uniform sampler2D tex; uniform vec2 res; uniform vec2 c; uniform float jr;",
+        "uniform float a; uniform float k; uniform float fade;",
+        "vec4 tx(vec2 q){ return texture2D(tex, q / res); }",
+        "void main(){",
+        "  vec2 p = (gl_FragCoord.xy - c) / jr; float r = length(p);",
+        "  if (r > 1.0) { gl_FragColor = vec4(0.0); return; }",
+        "  float s = a - k * r * r;",                                  // grossi au centre, étiré vers les bords
+        "  vec2 sp = p * s;",
+        "  float ca = 0.006 * r * r * r;",                             // irisation légère sur les bords
+        "  vec4 cr = tx(c + sp * (1.0 + ca) * jr), cg = tx(c + sp * jr), cb = tx(c + sp * (1.0 - ca) * jr);",
+        "  vec4 col = vec4(cr.r, cg.g, cb.b, max(cg.a, max(cr.a, cb.a)));",
+        "  float z = sqrt(max(0.0, 1.0 - r * r * 0.9));",
+        "  vec3 n = normalize(vec3(p * 0.95, z));",
+        "  vec3 L = normalize(vec3(-0.55, 0.62, 0.58));",              // lumière en haut à gauche
+        "  vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));",
+        "  float spec = pow(max(dot(n, H), 0.0), 90.0) * 0.40;",       // reflet qui suit la courbure
+        "  float sheen = pow(max(dot(n, L), 0.0), 12.0) * 0.025;",
+        "  float edge = smoothstep(0.86, 1.0, r);",
+        "  float lit = max(0.0, dot(normalize(p + 1e-5), normalize(L.xy)));",
+        "  float rimLight = edge * lit * 0.38;",                       // liseré clair côté lumière
+        "  float dark = 0.6 * smoothstep(0.5, 1.0, r) * smoothstep(0.5, 1.0, r) * (1.0 - 0.6 * lit * edge);",
+        "  col.rgb *= (1.0 - dark);",
+        "  col.a = col.a + (1.0 - col.a) * dark;",                     // assombrit aussi le fond sous le verre
+        "  vec3 glass = vec3(0.80, 0.93, 1.0) * (spec + sheen + rimLight);",
+        "  col.rgb += glass; col.a = min(1.0, col.a + (spec + sheen + rimLight));",
+        "  gl_FragColor = col * fade;",
+        "}"
+      ].join("\n");
+      function sh(type, src) {
+        var o = gl.createShader(type); gl.shaderSource(o, src); gl.compileShader(o);
+        if (!gl.getShaderParameter(o, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(o));
+        return o;
+      }
+      glProg = gl.createProgram();
+      gl.attachShader(glProg, sh(gl.VERTEX_SHADER, vs));
+      gl.attachShader(glProg, sh(gl.FRAGMENT_SHADER, fs));
+      gl.linkProgram(glProg);
+      if (!gl.getProgramParameter(glProg, gl.LINK_STATUS)) throw new Error("link");
+      gl.useProgram(glProg);
+      var buf = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      var loc = gl.getAttribLocation(glProg, "p");
+      gl.enableVertexAttribArray(loc);
+      gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+      glTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, glTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, true);
+      ["tex", "res", "c", "jr", "a", "k", "fade"].forEach(function (n) { glU[n] = gl.getUniformLocation(glProg, n); });
+      glOk = true;
+    } catch (e) { glOk = false; }
+  })();
+  function glLens(b) {
+    if (!glOk) return false;
+    try {
+      var W = canvas.width, H = canvas.height;
+      if (glc.width !== W || glc.height !== H) { glc.width = W; glc.height = H; }
+      gl.viewport(0, 0, W, H);
+      gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.bindTexture(gl.TEXTURE_2D, glTex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, jar);
+      gl.uniform1i(glU.tex, 0);
+      gl.uniform2f(glU.res, W, H);
+      gl.uniform2f(glU.c, cx * DPR, H - cy * DPR);
+      gl.uniform1f(glU.jr, JR * R * DPR);
+      gl.uniform1f(glU.a, CONFIG.lensCenter);
+      gl.uniform1f(glU.k, CONFIG.lensEdge);
+      gl.uniform1f(glU.fade, b);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.drawImage(glc, 0, 0);
+      ctx.restore();
+      return true;
+    } catch (e) { glOk = false; return false; }
+  }
+
+  // 7. Reflet doux sur la vitre (version de secours sans WebGL)
+  function drawHighlight(b) {
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.beginPath(); ctx.arc(cx, cy, JR * R, 0, TAU); ctx.clip();
+    var hx = cx - R * JR * 0.42, hy = cy - R * JR * 0.5;
+    ctx.translate(hx, hy); ctx.rotate(-0.6); ctx.scale(1, 0.45);
+    var g = ctx.createRadialGradient(0, 0, 0, 0, 0, R * 0.26);
+    g.addColorStop(0, "rgba(255,255,255," + (0.16 * b) + ")");
+    g.addColorStop(0.5, "rgba(255,255,255," + (0.06 * b) + ")");
+    g.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, R * 0.26, 0, TAU); ctx.fill();
+    ctx.restore();
+    // petit éclat secondaire en bas à droite
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    var g2 = ctx.createRadialGradient(cx + R * JR * 0.55, cy + R * JR * 0.5, 0, cx + R * JR * 0.55, cy + R * JR * 0.5, R * 0.08);
+    g2.addColorStop(0, "rgba(255,255,255," + (0.07 * b) + ")");
+    g2.addColorStop(1, "rgba(255,255,255,0)");
+    ctx.fillStyle = g2;
+    ctx.beginPath(); ctx.arc(cx + R * JR * 0.55, cy + R * JR * 0.5, R * 0.08, 0, TAU); ctx.fill();
+    ctx.restore();
+  }
+
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
