@@ -510,8 +510,18 @@
     tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     tctx.clearRect(0, 0, S, S);
     var size = R * 0.44;
-    var lines = [["400", hh, cy - R * 0.203], ["700", mm, cy + R * 0.214]];
-    tctx.textAlign = "center"; tctx.textBaseline = "middle";
+    var gapCenters = R * 0.417;            // distance entre le milieu des heures et le milieu des minutes
+    var lines = [["400", hh, cy - gapCenters / 2], ["700", mm, cy + gapCenters / 2]];
+    // Centrage sur la hauteur réelle des chiffres (et non sur le « milieu » de la police,
+    // qui tient compte des lettres descendantes et remonte les chiffres)
+    tctx.textAlign = "center"; tctx.textBaseline = "alphabetic";
+    for (var li = 0; li < 2; li++) {
+      tctx.font = lines[li][0] + " " + size + "px " + FONT;
+      var m = tctx.measureText(lines[li][1]);
+      var asc = m.actualBoundingBoxAscent, desc = m.actualBoundingBoxDescent;
+      if (!(asc > 0)) { asc = size * 0.72; desc = 0; }
+      lines[li][2] = lines[li][2] + (asc - desc) / 2;     // ligne de base telle que les chiffres soient centrés
+    }
     for (var pass = 0; pass < 3; pass++) {
       for (var i = 0; i < 2; i++) {
         tctx.font = lines[i][0] + " " + size + "px " + FONT;
