@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Diagnostic Kraken</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; color: #a0e7ff;
+    font-family: Bahnschrift, "Segoe UI", Arial, sans-serif; }
+  #wrap { position: absolute; left: 50%; top: 50%; width: 74vmin; height: 74vmin;
+    transform: translate(-50%, -50%); display: flex; flex-direction: column; }
+  h1 { margin: 0 0 1.2vmin; font-size: 3.4vmin; font-weight: 600; text-align: center; letter-spacing: .3vmin; }
+  #status { text-align: center; font-size: 2.6vmin; opacity: .75; margin-bottom: 1.5vmin; }
+  #list { flex: 1; columns: 2; column-gap: 3vmin; font-size: 2.35vmin; line-height: 1.32; }
+  .row { break-inside: avoid; display: flex; justify-content: space-between; gap: 1vmin;
+    border-bottom: 1px solid rgba(160,231,255,.12); }
+  .k { color: #ffffff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; flex: 1 1 auto; }
+  .v { color: #a0e7ff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 45%; flex: 0 1 auto; }
+  #page { text-align: center; font-size: 2.4vmin; opacity: .7; margin-top: 1vmin; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <h1>DONNÉES CAM</h1>
+  <div id="status">En attente des données…</div>
+  <div id="list"></div>
+  <div id="page"></div>
+</div>
+<script>
+(function () {
+  "use strict";
+  var last = null, count = 0, page = 0, PER_PAGE = 26;
+
+  // Aplatit l'objet : cpus[0].temperature = 61.2, etc.
+  function flatten(obj, prefix, out) {
+    if (obj === null || obj === undefined) { out.push([prefix, String(obj)]); return out; }
+    if (Array.isArray(obj)) {
+      if (!obj.length) out.push([prefix, "[]"]);
+      obj.forEach(function (v, i) { flatten(v, prefix + "[" + i + "]", out); });
+    } else if (typeof obj === "object") {
+      var keys = Object.keys(obj);
+      if (!keys.length) out.push([prefix, "{}"]);
+      keys.forEach(function (k) { flatten(obj[k], prefix ? prefix + "." + k : k, out); });
+    } else {
+      var v = typeof obj === "number" ? (Math.round(obj * 100) / 100).toString() : String(obj);
+      out.push([prefix, v]);
+    }
+    return out;
+  }
+
+  function onData(d) { last = d; count++; }
+  function attach() {
+    if (!window.nzxt || typeof window.nzxt !== "object") window.nzxt = {};
+    if (!window.nzxt.v1 || typeof window.nzxt.v1 !== "object") window.nzxt.v1 = {};
+    if (window.nzxt.v1.onMonitoringDataUpdate !== onData) window.nzxt.v1.onMonitoringDataUpdate = onData;
+  }
+  attach();
+  setInterval(attach, 1000);
+
+  function render() {
+    var status = document.getElementById("status");
+    var list = document.getElementById("list");
+    var pg = document.getElementById("page");
+    if (!last) {
+      status.textContent = "En attente des données… (normal dans un navigateur)";
+      return;
+    }
+    var rows = flatten(last, "", []);
+    var pages = Math.max(1, Math.ceil(rows.length / PER_PAGE));
+    page = page % pages;
+    status.textContent = rows.length + " valeurs · mise à jour n°" + count;
+    list.innerHTML = "";
+    rows.slice(page * PER_PAGE, (page + 1) * PER_PAGE).forEach(function (r) {
+      var div = document.createElement("div");
+      div.className = "row";
+      var k = document.createElement("span"); k.className = "k"; k.textContent = r[0];
+      var v = document.createElement("span"); v.className = "v"; v.textContent = r[1];
+      div.appendChild(k); div.appendChild(v);
+      list.appendChild(div);
+    });
+    pg.textContent = pages > 1 ? "Page " + (page + 1) + " / " + pages : "";
+  }
+  setInterval(render, 1000);
+  // Change de page toutes les 8 secondes s'il y a beaucoup de valeurs
+  setInterval(function () { page++; }, 8000);
+})();
+</script>
+</body>
+</html>
