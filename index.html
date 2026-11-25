@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Reactor Core — Kraken Elite</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Oxanium:wght@400;700&display=swap" rel="stylesheet">
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   body { display: flex; align-items: center; justify-content: center; }
@@ -16,63 +19,39 @@
 (function () {
   "use strict";
 
-  /* ---------- Réglages faciles ---------- */
+  /* =====================================================================
+     RÉGLAGES
+     ===================================================================== */
   var CONFIG = {
-    // Couleur générale selon la température du LIQUIDE : [°C, position dans le dégradé 0-1]
-    // 0 = blanc glacier, 0.5 = bleu, 0.75 = violet, 0.9 = magenta, 1 = rouge
-    liquidScale: [
-      [35, 0.00],   // jusqu'à 35 °C (ventilos 35 %) : blanc glacier
-      [40, 0.55],   // 40 °C (ventilos 45 %) : bleu
-      [45, 0.75],   // 45 °C (ventilos 60 %) : violet
-      [50, 0.90],   // 50 °C (ventilos 85 %) : magenta
-      [55, 1.00]    // 55 °C (ventilos 100 %) : rouge
-    ],
-    // Dégradé de couleur selon la température : [position 0-1, teinte, "blanchiment" 0-1]
-    // 0 = blanc glacier #a0e7ff, puis bleu, violet, magenta, rouge
-    palette: [
-      [0.00, 195, 1.00],
-      [0.30, 198, 0.60],
-      [0.50, 215, 0.20],
-      [0.68, 270, 0.00],
-      [0.82, 330, 0.00],
-      [0.92, 355, 0.00],
-      [1.00, 360, 0.00]
-    ],
-    defaultFps: 30,
-    cycleSeconds: 6,    // durée d'affichage de chaque valeur
-    sparks: true        // étincelles qui jaillissent du cœur selon la charge CPU (false pour les retirer)
+    liquidRange: [30, 50],   // °C : cœur presque vide -> presque plein
+    liquidAlert: 50,         // au-delà, la surface du liquide pulse en rouge
+    cpuRange: [20, 89],      // arc gauche (continu, tête ronde)
+    gpuRange: [30, 85],      // arc droit (segmenté, tête en losange)
+    cpuAlert: 85,
+    gpuAlert: 85,
+    gpuMaxPower: 220,        // W, pour doser les étincelles (RX 9070)
+    gpuIdlePower: 60,        // W : en dessous, l'eau est calme
+    // L'agitation de l'eau (vagues, bulles, gouttelettes) suit la consommation du GPU
+    defaultFps: 30
   };
 
-  // Valeurs affichées tour à tour au centre (min/max = échelle de la jauge)
-  var METRICS = [
-    // trend = écart (°C) à partir duquel on considère que la valeur monte ou descend nettement
-    { key: "cpu", label: "CPU",     unit: "°", min: 20, max: 90, trend: 1.5 },
-    { key: "gpu", label: "GPU",     unit: "°", min: 20, max: 90, trend: 1.5 },
-    { key: "liq", label: "LIQUIDE", unit: "°", min: 25, max: 55, trend: 0.25 }
-    // Pour ajouter les charges : { key: "load",    label: "CPU", unit: "%", min: 0, max: 100 }
-    //                            { key: "gpuLoad", label: "GPU", unit: "%", min: 0, max: 100 }
-  ];
+  // Teinte unique : blanc glacier #a0e7ff, avec un léger écart entre les deux jauges
+  var GLACIER = { h: 195, w: 1.00 };
+  var CPU_TINT = { h: 203, w: 0.70 };   // un peu plus bleuté
+  var GPU_TINT = { h: 186, w: 1.00 };   // un peu plus blanc/cyan
 
-  var params = new URLSearchParams(location.search);
-  var onKraken = params.get("kraken") === "1";
+  var href = location.href;
+  var onKraken = /[?&]kraken=1/.test(href);
+  var showFps = /fps=1/.test(href);
 
-  /* ---------- Données ---------- */
-  var state = { cpu: 35, gpu: 35, liq: 28, load: 0.1, gpuLoad: 0.1, live: false };
-  var disp  = { cpu: 35, gpu: 35, liq: 28, load: 0.1, gpuLoad: 0.1 };
-  var calm  = { cpu: 35, gpu: 35, liq: 28, load: 0.1, gpuLoad: 0.1 };   // valeurs lissées sur ~2,5 s pour le chiffre
-  function metricValue(m, src) { return m.unit === "%" ? src[m.key] * 100 : src[m.key]; }
-
-  // Animation de l'affichage central
-  var anim = {
-    idx: 0, prev: -1, since: 0,   // valeur affichée, précédente, temps écoulé
-    shown: 0,                     // nombre du compteur à rouleaux (part de 0 au démarrage)
-    gauge: 0,                     // remplissage de la jauge
-    burst: 1,                     // éclair lumineux au changement
-    boot: 0                       // séquence de démarrage 0 -> 1
-  };
+  /* =====================================================================
+     DONNÉES CAM
+     ===================================================================== */
+  var state = { cpu: 45, gpu: 40, liq: 36, load: 0.1, gpuPower: 30, ram: 0.4, live: false };
+  var calm  = { cpu: 45, gpu: 40, liq: 36, load: 0.1, gpuPower: 30, ram: 0.4 };
+  var TAUS  = { cpu: 4, gpu: 3, liq: 2, load: 1.2, gpuPower: 1, ram: 2 };
 
   function num(v) { return typeof v === "number" && isFinite(v) ? v : null; }
-
   function pickGpu(gpus) {
     if (!gpus || !gpus.length) return null;
     for (var i = 0; i < gpus.length; i++) {
@@ -80,25 +59,21 @@
     }
     return gpus[gpus.length - 1];
   }
-
-  // Réception des données CAM (environ une fois par seconde)
   function onData(d) {
     if (!d) return;
-    var c = d.cpus && d.cpus[0];
-    var g = pickGpu(d.gpus);
-    var k = d.kraken;
+    var c = d.cpus && d.cpus[0], g = pickGpu(d.gpus), r = d.ram, k = d.kraken;
     if (c) {
       if (num(c.temperature) !== null) state.cpu = c.temperature;
       if (num(c.load) !== null) state.load = c.load > 1 ? c.load / 100 : c.load;
     }
-    if (g && num(g.temperature) !== null) state.gpu = g.temperature;
-    if (g && num(g.load) !== null) state.gpuLoad = g.load > 1 ? g.load / 100 : g.load;
+    if (g) {
+      if (num(g.temperature) !== null) state.gpu = g.temperature;
+      if (num(g.power) !== null) state.gpuPower = g.power;
+    }
+    if (r && num(r.inUse) !== null && num(r.totalSize) && r.totalSize > 0) state.ram = r.inUse / r.totalSize;
     if (k && num(k.liquidTemperature) !== null) state.liq = k.liquidTemperature;
     state.live = true;
   }
-
-  // On branche le récepteur sans effacer ce que CAM a mis dans window.nzxt.v1
-  // (largeur, hauteur, fps…), et on le rebranche si CAM le remplace plus tard.
   function attach() {
     if (!window.nzxt || typeof window.nzxt !== "object") window.nzxt = {};
     if (!window.nzxt.v1 || typeof window.nzxt.v1 !== "object") window.nzxt.v1 = {};
@@ -108,61 +83,182 @@
   setInterval(attach, 1000);
   window.addEventListener("load", attach);
 
-  /* ---------- Canvas ---------- */
+  /* =====================================================================
+     OUTILS
+     ===================================================================== */
+  var TAU = Math.PI * 2;
+  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function easeOut(x) { return 1 - Math.pow(1 - clamp(x, 0, 1), 3); }
+  function range01(v, r) { return clamp((v - r[0]) / (r[1] - r[0]), 0, 1); }
+  function col(th, s, l, a) {
+    l = l + (100 - l) * 0.52 * th.w * clamp((l - 15) / 40, 0, 1);
+    return "hsla(" + th.h.toFixed(1) + "," + s + "%," + l.toFixed(1) + "%," + clamp(a, 0, 1).toFixed(3) + ")";
+  }
+  function red(l, a) { return "hsla(358,100%," + l + "%," + clamp(a, 0, 1).toFixed(3) + ")"; }
+
+  /* =====================================================================
+     CANVAS
+     ===================================================================== */
   var canvas = document.getElementById("c");
   var ctx = canvas.getContext("2d");
-  var S = 640, R = 320, cx = 320, cy = 320;
-
+  var S = 640, R = 320, cx = 320, cy = 320, DPR = 1;
   function resize() {
     var v1 = window.nzxt.v1;
-    var w = num(v1.width) || window.innerWidth;
-    var h = num(v1.height) || window.innerHeight;
+    var w = num(v1.width) || window.innerWidth, h = num(v1.height) || window.innerHeight;
     S = Math.max(100, Math.min(w, h, window.innerWidth, window.innerHeight));
     var dpr = onKraken ? 1 : (window.devicePixelRatio || 1);
-    canvas.width = Math.round(S * dpr);
-    canvas.height = Math.round(S * dpr);
-    canvas.style.width = S + "px";
-    canvas.style.height = S + "px";
+    DPR = dpr;
+    canvas.width = Math.round(S * dpr); canvas.height = Math.round(S * dpr);
+    canvas.style.width = S + "px"; canvas.style.height = S + "px";
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     R = S / 2; cx = R; cy = R;
   }
   window.addEventListener("resize", resize);
   resize();
 
-  /* ---------- Outils ---------- */
-  var TAU = Math.PI * 2;
-  function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
-  function lerp(a, b, t) { return a + (b - a) * t; }
-  function heatOf(temp) {
-    var L = CONFIG.liquidScale;
-    if (temp <= L[0][0]) return L[0][1];
-    for (var i = 1; i < L.length; i++) {
-      if (temp <= L[i][0]) return lerp(L[i - 1][1], L[i][1], (temp - L[i - 1][0]) / (L[i][0] - L[i - 1][0]));
-    }
-    return L[L.length - 1][1];
+  var FONT = "Oxanium, Bahnschrift, 'Segoe UI', Arial, sans-serif";
+  if (document.fonts && document.fonts.load) {
+    document.fonts.load("400 100px Oxanium");
+    document.fonts.load("700 100px Oxanium");
   }
-  // Renvoie une "teinte" {h, w} : w = part de blanc glacier
-  function hueOf(t) {
-    var P = CONFIG.palette;
-    t = clamp(t, 0, 1);
-    for (var i = 1; i < P.length; i++) {
-      if (t <= P[i][0]) {
-        var u = (t - P[i - 1][0]) / (P[i][0] - P[i - 1][0]);
-        return { h: lerp(P[i - 1][1], P[i][1], u), w: lerp(P[i - 1][2], P[i][2], u) };
+
+  /* =====================================================================
+     ÉTAT DE L'ANIMATION
+     ===================================================================== */
+  var t = 0, last = performance.now(), lastDraw = 0, startTime = performance.now();
+  var boot = 0;
+  var rotCells = 0, wave = 0, rotComets = 0, cometDir = 0;
+  var fastLiq = null, slowLiq = null;
+  var arcCpu = 0, arcGpu = 0;
+  var peak = { cpu: 0, gpu: 0, holdCpu: 0, holdGpu: 0 };
+  var ramLit = 0, level = 0;
+  var bubbles = [], bubbleAcc = 0, pops = [], drops = [], dropAcc = 0;
+  var agi = 0, ph1 = 0, ph2 = 0, ph3 = 0;   // agitation 0-1 et phases des vagues
+  var fpsCount = 0, fpsShown = 0, fpsTime = performance.now();
+
+  function updatePeak(key, holdKey, frac, dt) {
+    if (frac >= peak[key]) { peak[key] = frac; peak[holdKey] = 1.8; }
+    else if (peak[holdKey] > 0) peak[holdKey] -= dt;
+    else peak[key] = Math.max(frac, peak[key] - 0.06 * dt);   // retombe doucement
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var fps = num(window.nzxt.v1.targetFps) || CONFIG.defaultFps;
+    if (now - lastDraw < 1000 / fps - 2) return;
+    lastDraw = now;
+    var dt = Math.min(1, Math.max(0, (now - last) / 1000));
+    last = now;
+    t += dt;
+
+    fpsCount++;
+    if (now - fpsTime >= 1000) { fpsShown = Math.round(fpsCount * 1000 / (now - fpsTime)); fpsCount = 0; fpsTime = now; }
+
+    if (!state.live && (!onKraken || now - startTime > 2000)) {
+      state.load = clamp(0.35 + 0.3 * Math.sin(t / 3.1) * Math.sin(t / 7.3), 0, 1);
+      state.cpu = 62 + 14 * Math.sin(t / 6);
+      state.gpu = 55 + 22 * Math.sin(t / 8 + 1);
+      state.liq = 39 + 6 * Math.sin(t / 12);
+      state.gpuPower = 110 + 100 * Math.sin(t / 5);
+      state.ram = 0.45 + 0.15 * Math.sin(t / 11);
+    }
+
+    for (var key in calm) calm[key] += (state[key] - calm[key]) * (1 - Math.exp(-dt / TAUS[key]));
+
+    boot = Math.min(1, boot + dt / 1.8);
+    var b = easeOut(boot);
+    var load = calm.load;
+
+    // Vitesses plafonnées selon les images/s (pas d'effet « roue de diligence »)
+    rotCells += dt * Math.min(0.06 + load * 0.9, 0.25 * (TAU / 24) * fps);
+    wave += dt * Math.min(1 + load * 3, 0.15 * TAU * fps / 6);
+
+    if (fastLiq === null) { fastLiq = slowLiq = state.liq; }
+    fastLiq += (state.liq - fastLiq) * (1 - Math.exp(-dt / 3));
+    slowLiq += (state.liq - slowLiq) * (1 - Math.exp(-dt / 15));
+    cometDir += (Math.tanh((fastLiq - slowLiq) / 0.25) - cometDir) * (1 - Math.exp(-dt / 1.2));
+    rotComets += dt * cometDir * Math.min(0.5 + load * 1.6, 0.25 * (TAU / 3) * fps);
+
+    var fc = range01(calm.cpu, CONFIG.cpuRange) * b, fg = range01(calm.gpu, CONFIG.gpuRange) * b;
+    arcCpu += (fc - arcCpu) * (1 - Math.exp(-dt * 3));
+    arcGpu += (fg - arcGpu) * (1 - Math.exp(-dt * 3));
+    updatePeak("cpu", "holdCpu", arcCpu, dt);
+    updatePeak("gpu", "holdGpu", arcGpu, dt);
+
+    ramLit += (clamp(calm.ram, 0, 1) * 24 - ramLit) * (1 - Math.exp(-dt * 2));
+    level += (lerp(0.08, 0.92, range01(calm.liq, CONFIG.liquidRange)) * b - level) * (1 - Math.exp(-dt * 1.5));
+
+    // Agitation de l'eau = consommation GPU (montée ~2 s, retombée ~4 s, jamais brutale)
+    var agiTarget = Math.pow(clamp((calm.gpuPower - CONFIG.gpuIdlePower) / (CONFIG.gpuMaxPower - CONFIG.gpuIdlePower), 0, 1), 0.9);
+    agi += (agiTarget - agi) * (1 - Math.exp(-dt / (agiTarget > agi ? 2 : 4)));
+    // phases intégrées : la vitesse des vagues change sans à-coups
+    ph1 += dt * (1.2 + 2.6 * agi);
+    ph2 += dt * (1.7 + 3.4 * agi);
+    ph3 += dt * (2.5 + 5.0 * agi);
+
+    // Bulles : rares au repos, nombreuses et plus grosses en pleine charge
+    bubbleAcc += dt * (0.35 + 11 * Math.pow(agi, 1.5)) * b;
+    while (bubbleAcc >= 1) {
+      bubbleAcc -= 1;
+      if (bubbles.length < 16) bubbles.push({
+        x: (Math.random() * 2 - 1) * 0.45, y: 0.6,
+        v: 0.07 + 0.08 * Math.random() + 0.22 * agi,
+        r: (0.005 + 0.007 * Math.random()) * (1 + 1.3 * agi),
+        ph: Math.random() * TAU, wob: 0.006 + 0.012 * agi
+      });
+    }
+    for (var j = bubbles.length - 1; j >= 0; j--) {
+      var bu = bubbles[j];
+      bu.y -= bu.v * dt; bu.ph += dt * (3 + 4 * agi);
+      if (bu.y < surfaceAt(bu.x) + bu.r) {                  // éclate à la surface : petite onde
+        if (pops.length < 12) pops.push({ x: bu.x, life: 0, max: 0.45, r: bu.r });
+        bubbles.splice(j, 1);
       }
     }
-    return { h: P[P.length - 1][1], w: P[P.length - 1][2] };
-  }
-  function easeOut(x) { return 1 - Math.pow(1 - clamp(x, 0, 1), 3); }
-  function easeInOut(x) { x = clamp(x, 0, 1); return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2; }
-  function hsla(h, s, l, a) {
-    if (typeof h === "object") {
-      // éclaircit les tons lumineux vers le blanc glacier, sans toucher au fond sombre
-      l = l + (100 - l) * 0.52 * h.w * clamp((l - 15) / 40, 0, 1);
-      h = h.h;
-    }
-    return "hsla(" + h.toFixed(1) + "," + s + "%," + l + "%," + a.toFixed(3) + ")"; }
+    for (var q = pops.length - 1; q >= 0; q--) { pops[q].life += dt; if (pops[q].life > pops[q].max) pops.splice(q, 1); }
 
+    // Gouttelettes projetées : seulement quand ça bout vraiment
+    dropAcc += dt * Math.max(0, agi - 0.65) * 18 * b;
+    while (dropAcc >= 1) {
+      dropAcc -= 1;
+      if (drops.length < 10) {
+        var dx0 = (Math.random() * 2 - 1) * 0.4;
+        drops.push({ x: dx0, y: surfaceAt(dx0), vx: (Math.random() - 0.5) * 0.12, vy: -(0.22 + Math.random() * 0.2), r: 0.005 + Math.random() * 0.004 });
+      }
+    }
+    for (var di = drops.length - 1; di >= 0; di--) {
+      var dr = drops[di];
+      dr.vy += 1.1 * dt; dr.x += dr.vx * dt; dr.y += dr.vy * dt;
+      if (dr.vy > 0 && dr.y > surfaceAt(dr.x)) drops.splice(di, 1);
+    }
+
+    draw(load, b);
+  }
+
+  /* =====================================================================
+     LIQUIDE : surface ondulée (en unités de R, relatives au centre)
+     ===================================================================== */
+  var RC = 0.625;   // rayon intérieur du cœur
+  function surfaceAt(x) {   // x en unités de R (-RC..RC) -> y en unités de R
+    var base = RC - level * 2 * RC;
+    var a1 = 0.006 + 0.026 * agi, a2 = 0.004 + 0.018 * agi, a3 = 0.012 * agi * agi;   // vagues plus hautes et plus hachées quand ça chauffe
+    return base + a1 * Math.sin(x * 9 + ph1) + a2 * Math.sin(x * 15 - ph2) + a3 * Math.sin(x * 31 + ph3);
+  }
+  function surfacePath(close) {
+    ctx.beginPath();
+    var steps = 40;
+    for (var i = 0; i <= steps; i++) {
+      var x = -RC + (2 * RC) * i / steps;
+      var px = cx + x * R, py = cy + surfaceAt(x) * R;
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    if (close) { ctx.lineTo(cx + RC * R, cy + R); ctx.lineTo(cx - RC * R, cy + R); ctx.closePath(); }
+  }
+
+  /* =====================================================================
+     DESSIN
+     ===================================================================== */
   function sector(r1, r2, a1, a2) {
     ctx.beginPath();
     ctx.arc(cx, cy, r2, a1, a2);
@@ -170,387 +266,305 @@
     ctx.closePath();
   }
 
-  var FONT = "Bahnschrift, 'Segoe UI', 'Helvetica Neue', Arial, sans-serif";
-  function text(str, x, y, size, weight, color, spacing) {
-    ctx.font = weight + " " + size + "px " + FONT;
-    if ("letterSpacing" in ctx) ctx.letterSpacing = (spacing || 0) + "px";
-    ctx.fillStyle = color;
-    ctx.fillText(str, x, y);
-    if ("letterSpacing" in ctx) ctx.letterSpacing = "0px";
-  }
-
-  /* ---------- Animation ---------- */
-  var t = 0, last = performance.now(), lastDraw = 0;
-  var rotSeg = 0, rotDash = 0, wave = 0;
-  // Tendance : moyenne rapide (~3 s) comparée à une moyenne lente (~15 s)
-  var fast = { cpu: 0, gpu: 0, liq: 0, load: 0, gpuLoad: 0 };
-  var slow = { cpu: 0, gpu: 0, liq: 0, load: 0, gpuLoad: 0 };
-  var trendInit = false;
-  var coreDir = 0, coreRot = 0;          // -1 descend, 0 stable, +1 monte (lissé)
-  var sparks = [], sparkAcc = 0;
-  var startTime = performance.now();
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    var fps = num(window.nzxt.v1.targetFps) || CONFIG.defaultFps;
-    if (now - lastDraw < 1000 / fps - 2) return;
-    lastDraw = now;
-
-    // Temps réel écoulé (plafonné à 1 s seulement après une mise en veille),
-    // pour que le cycle reste régulier même si l'écran rafraîchit de façon irrégulière.
-    var dt = Math.min(1, Math.max(0, (now - last) / 1000));
-    last = now;
-    t += dt;
-
-    // Mode démo si CAM n'envoie rien (aperçu dans un navigateur)
-    if (!state.live && (!onKraken || now - startTime > 2000)) {
-      state.load = 0.45 + 0.4 * Math.sin(t / 3.1) * Math.sin(t / 7.3);
-      state.gpuLoad = 0.5 + 0.45 * Math.sin(t / 4.4 + 2);
-      state.cpu = 52 + 22 * Math.sin(t / 4.2) + 4 * Math.sin(t * 1.3);
-      state.gpu = 48 + 18 * Math.sin(t / 5.1 + 1);
-      state.liq = 31 + 3 * Math.sin(t / 9);
-    }
-
-    var k = 1 - Math.exp(-dt * 2.5);
-    disp.cpu += (state.cpu - disp.cpu) * k;
-    disp.gpu += (state.gpu - disp.gpu) * k;
-    disp.liq += (state.liq - disp.liq) * k;
-    disp.load += (clamp(state.load, 0, 1) - disp.load) * k;
-    disp.gpuLoad += (clamp(state.gpuLoad, 0, 1) - disp.gpuLoad) * k;
-
-    var heat = heatOf(disp.liq);
-    var hue = hueOf(heat);
-    var load = disp.load;   // vitesse des anneaux = charge CPU (la charge GPU de la RX 9070 reste souvent haute)
-
-    rotSeg   += dt * (0.12 + load * 1.1);
-    rotDash  -= dt * (0.25 + load * 1.6);
-    wave     += dt * (1.2 + load * 3.5);
-
-    // Démarrage, rotation des valeurs, compteur, jauge
-    anim.boot = Math.min(1, anim.boot + dt / 1.6);
-    anim.since += dt;
-    if (anim.since > CONFIG.cycleSeconds) {
-      anim.prev = anim.idx;
-      anim.idx = (anim.idx + 1) % METRICS.length;
-      anim.since = 0;
-      anim.burst = 1;
-    }
-    anim.burst = Math.max(0, anim.burst - dt * 1.4);
-    var m = METRICS[anim.idx];
-    var kc = 1 - Math.exp(-dt / 2.5);
-    for (var key in calm) calm[key] += (state[key] - calm[key]) * kc;
-    var target = Math.round(metricValue(m, calm));
-    anim.shown += (target - anim.shown) * (1 - Math.exp(-dt * (anim.boot < 1 ? 2.2 : 7)));
-    if (Math.abs(target - anim.shown) < 0.003) anim.shown = target;
-    var gTarget = clamp((metricValue(m, calm) - m.min) / (m.max - m.min), 0, 1) * easeOut(anim.boot);
-    anim.gauge += (gTarget - anim.gauge) * (1 - Math.exp(-dt * 3.5));
-
-    // Tendance de la valeur affichée -> sens de rotation du cœur
-    if (!trendInit) { for (var k0 in fast) { fast[k0] = slow[k0] = state[k0]; } trendInit = true; }
-    var kf = 1 - Math.exp(-dt / 3), ks = 1 - Math.exp(-dt / 15);
-    for (var k1 in fast) { fast[k1] += (state[k1] - fast[k1]) * kf; slow[k1] += (state[k1] - slow[k1]) * ks; }
-    var tr = m.unit === "%" ? (fast[m.key] - slow[m.key]) * 100 : fast[m.key] - slow[m.key];
-    var dirTarget = Math.tanh(tr / (m.trend || 1.5));
-    coreDir += (dirTarget - coreDir) * (1 - Math.exp(-dt / 1.2));   // inversion douce : ralentit, s'arrête, repart
-    coreRot += dt * coreDir * (0.9 + load * 1.2);
-
-    // Étincelles
-    if (CONFIG.sparks) {
-      sparkAcc += dt * load * 35 * easeOut(anim.boot);
-      while (sparkAcc >= 1 && sparks.length < 70) {
-        sparkAcc -= 1;
-        sparks.push({ a: Math.random() * TAU, r: 0.62, v: 0.18 + Math.random() * 0.25, life: 0, max: 0.6 + Math.random() * 0.7 });
-      }
-      if (sparkAcc > 1) sparkAcc = 0;
-      for (var si = sparks.length - 1; si >= 0; si--) {
-        var sp = sparks[si];
-        sp.life += dt; sp.r += sp.v * dt; sp.a += coreDir * dt * 0.4;
-        if (sp.life > sp.max || sp.r > 0.8) sparks.splice(si, 1);
-      }
-    }
-
-    draw(hue, heat, load);
-  }
-
-  function draw(hue, heat, load) {
+  function draw(load, b) {
+    var th = GLACIER;
     ctx.save();
     ctx.clearRect(0, 0, S, S);
-    ctx.beginPath();
-    ctx.arc(cx, cy, R, 0, TAU);
-    ctx.clip();
+    ctx.beginPath(); ctx.arc(cx, cy, R, 0, TAU); ctx.clip();
 
-    // Fond
     var bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
-    bg.addColorStop(0, hsla(hue, 60, 3, 1));
-    bg.addColorStop(0.55, hsla(hue, 50, 2.5, 1));
+    bg.addColorStop(0, col(th, 60, 3, 1));
+    bg.addColorStop(0.6, col(th, 50, 2.5, 1));
     bg.addColorStop(1, "#000");
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, S, S);
 
     ctx.globalCompositeOperation = "lighter";
+    drawCells(th);
+    drawArcCpu(b);
+    drawArcGpu(b);
+    drawCore(th, load, b);
+    drawComets(th, b);
+    ctx.globalCompositeOperation = "source-over";
 
-    // 1. Anneau de cellules en bord d'écran (vitesse = charge)
-    var NS = 24, gap = 0.04;
-    ctx.shadowColor = hsla(hue, 100, 60, 0.9);
-    ctx.shadowBlur = R * 0.05;
-    for (var j = 0; j < NS; j++) {
-      var s1 = rotSeg + j * TAU / NS + gap / 2;
-      var s2 = rotSeg + (j + 1) * TAU / NS - gap / 2;
-      var w = 0.5 + 0.5 * Math.sin(wave - j * TAU / NS * 2);
-      var b = 0.18 + 0.82 * Math.pow(w, 3);
-      var reveal = clamp(anim.boot * (NS + 4) - j, 0, 1);
-      if (reveal <= 0) continue;
-      b = Math.min(1, b + anim.burst * 0.5);
-      ctx.globalAlpha = reveal;
-      sector(R * 0.815, R * 0.985, s1, s2);
-      ctx.fillStyle = hsla(hue, 100, lerp(30, 66, b), 0.15 + 0.75 * b);
-      ctx.fill();
+    drawLiquidAndTime(th, b);
+
+    if (showFps) {
+      ctx.font = "600 " + (R * 0.05) + "px " + FONT;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(255,255,255,0.75)";
+      ctx.fillText(fpsShown + " i/s", cx, cy - R * 0.52);
     }
-    ctx.globalAlpha = 1;
-    ctx.shadowBlur = 0;
-    ctx.strokeStyle = hsla(hue, 100, 70, 0.25);
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.arc(cx, cy, R * 0.80, 0, TAU); ctx.stroke();
+    if (!state.live) {
+      ctx.font = "600 " + (R * 0.045) + "px " + FONT;
+      ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillStyle = "rgba(255,255,255," + (0.35 * b) + ")";
+      ctx.fillText("DÉMO", cx, cy + R * 0.52);
+    }
+    ctx.restore();
+  }
 
-    // 2. Jauge de la valeur affichée (anneau intermédiaire)
-    var rg = R * 0.715, gw = R * 0.05;
-    var a0 = Math.PI * 0.75, sweep = Math.PI * 1.5;   // départ en bas à gauche, 270°
-    var frac = anim.gauge;
-    var bootA = easeOut(anim.boot);
-    //   piste : tirets fins qui défilent lentement, ouverte en bas
-    ctx.setLineDash([R * 0.012, R * 0.018]);
-    ctx.lineDashOffset = -rotDash * R * 0.15;
-    ctx.strokeStyle = hsla(hue, 90, 60, 0.16 * bootA);
-    ctx.lineWidth = gw;
-    ctx.beginPath(); ctx.arc(cx, cy, rg, a0, a0 + sweep); ctx.stroke();
-    ctx.setLineDash([]);
-    ctx.lineDashOffset = 0;
-    //   fins liserés + petites butées aux extrémités
-    ctx.strokeStyle = hsla(hue, 100, 70, 0.22 * bootA);
-    ctx.lineWidth = 1;
-    ctx.beginPath(); ctx.arc(cx, cy, rg + gw * 0.75, a0, a0 + sweep); ctx.stroke();
-    ctx.beginPath(); ctx.arc(cx, cy, rg - gw * 0.75, a0, a0 + sweep); ctx.stroke();
-    [a0, a0 + sweep].forEach(function (ea) {
-      ctx.beginPath();
-      ctx.moveTo(cx + Math.cos(ea) * (rg - gw * 0.75), cy + Math.sin(ea) * (rg - gw * 0.75));
-      ctx.lineTo(cx + Math.cos(ea) * (rg + gw * 0.75), cy + Math.sin(ea) * (rg + gw * 0.75));
-      ctx.stroke();
-    });
-    //   arc allumé : même teinte que l'ensemble, du plus profond au plus lumineux
-    if (frac > 0.002) {
-      var aEnd = a0 + sweep * frac;
-      var span = 0.75 * frac;                       // part du cercle couverte (pour le dégradé)
-      var deep = { h: (hue.h - 14), w: hue.w * 0.4 }; // teinte décalée, plus saturée
-      var gradOk = typeof ctx.createConicGradient === "function";
-      function ring(l1, l2, alpha, width) {
-        if (gradOk) {
-          var cg = ctx.createConicGradient(a0, cx, cy);
-          cg.addColorStop(0, hsla(deep, 100, l1, alpha * 0.8));
-          cg.addColorStop(span * 0.55, hsla(hue, 100, (l1 + l2) / 2, alpha));
-          cg.addColorStop(Math.max(span, 0.001), hsla(hue, 100, l2, alpha));
-          if (span < 1) cg.addColorStop(Math.min(1, span + 0.001), hsla(hue, 100, l2, 0));
-          ctx.strokeStyle = cg;
-        } else {
-          ctx.strokeStyle = hsla(hue, 100, l2, alpha);
-        }
-        ctx.lineWidth = width;
+  // 1. Cellules = RAM utilisée
+  function drawCells(th) {
+    var NS = 24, gap = 0.04, r1 = R * 0.815, r2 = R * 0.985, lw = Math.max(2, R * 0.006);
+    for (var j = 0; j < NS; j++) {
+      var reveal = clamp(boot * (NS + 4) - j, 0, 1);
+      if (reveal <= 0) continue;
+      var s1 = rotCells + j * TAU / NS + gap / 2 - Math.PI / 2;
+      var s2 = rotCells + (j + 1) * TAU / NS - gap / 2 - Math.PI / 2;
+      var fill = clamp(ramLit - j, 0, 1);
+      sector(r1, r2, s1, s2);
+      ctx.fillStyle = col(th, 70, 40, 0.07 * reveal); ctx.fill();
+      ctx.strokeStyle = col(th, 90, 60, 0.22 * reveal); ctx.lineWidth = lw; ctx.stroke();
+      if (fill > 0) {
+        var w = 0.5 + 0.5 * Math.sin(wave - j * TAU / NS * 2);
+        var br = 0.45 + 0.55 * w * w;
+        sector(r1 - R * 0.012, r2 + R * 0.012, s1 - 0.01, s2 + 0.01);
+        ctx.fillStyle = col(th, 100, 60, 0.12 * br * fill * reveal); ctx.fill();
+        sector(r1, r2, s1, s2);
+        ctx.fillStyle = col(th, 100, lerp(38, 66, br), (0.35 + 0.6 * br) * fill * reveal); ctx.fill();
+      }
+    }
+  }
+
+  // Géométrie commune des deux jauges
+  var RG = 0.715, GW = 0.05, GAPB = 0.22, GAPT = 0.12, SPAN = Math.PI - GAPB - GAPT;
+  function angleOf(side, frac) { return Math.PI / 2 + side * (GAPB + SPAN * frac); }
+
+  function drawTrackLines(th, side, b) {
+    var a0 = angleOf(side, 0), a1 = angleOf(side, 1);
+    var lo = Math.min(a0, a1), hi = Math.max(a0, a1), rg = R * RG, gw = R * GW;
+    ctx.strokeStyle = col(th, 100, 70, 0.22 * b);
+    ctx.lineWidth = Math.max(2, R * 0.005);
+    ctx.beginPath(); ctx.arc(cx, cy, rg + gw * 0.72, lo, hi); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, rg - gw * 0.72, lo, hi); ctx.stroke();
+  }
+
+  // 2a. CPU (gauche) : arc continu, tête ronde
+  function drawArcCpu(b) {
+    var th = CPU_TINT, side = +1, rg = R * RG, gw = R * GW, frac = arcCpu;
+    var alert = calm.cpu >= CONFIG.cpuAlert;
+    var a0 = angleOf(side, 0), aEnd = angleOf(side, frac), aFull = angleOf(side, 1), aPk = angleOf(side, peak.cpu);
+    ctx.strokeStyle = col(th, 90, 60, 0.09 * b); ctx.lineWidth = gw;
+    ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aFull); ctx.stroke();
+    drawTrackLines(th, side, b);
+
+    // maximum récent qui retombe : prolongement translucide
+    if (peak.cpu > frac + 0.004) {
+      ctx.strokeStyle = col(th, 100, 70, 0.22 * b); ctx.lineWidth = gw * 0.8;
+      ctx.beginPath(); ctx.arc(cx, cy, rg, aEnd, aPk); ctx.stroke();
+    }
+    if (frac > 0.003) {
+      var spanFrac = (aEnd - a0) / TAU;
+      var g = typeof ctx.createConicGradient === "function" ? ctx.createConicGradient(a0, cx, cy) : null;
+      function grad(l1, l2, alpha) {
+        if (!g) return col(th, 100, l2, alpha);
+        var gg = ctx.createConicGradient(a0, cx, cy);
+        gg.addColorStop(0, col(th, 100, l1, alpha * 0.8));
+        gg.addColorStop(Math.max(spanFrac, 0.001), col(th, 100, l2, alpha));
+        gg.addColorStop(Math.min(1, spanFrac + 0.002), col(th, 100, l2, 0));
+        return gg;
+      }
+      ctx.strokeStyle = grad(45, 62, 0.18); ctx.lineWidth = gw * 2.2;
+      ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
+      ctx.strokeStyle = grad(48, 76, 0.95); ctx.lineWidth = gw;
+      ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
+      if (alert) {
+        ctx.strokeStyle = red(55, 0.35 + 0.45 * (0.5 + 0.5 * Math.sin(t * 6))); ctx.lineWidth = gw * 1.1;
         ctx.beginPath(); ctx.arc(cx, cy, rg, a0, aEnd); ctx.stroke();
       }
-      ring(45, 62, 0.18, gw * 2.2);   // halo
-      ring(48, 76, 0.95, gw);         // trait
-      //   tête lumineuse
       var hx = cx + Math.cos(aEnd) * rg, hy = cy + Math.sin(aEnd) * rg;
-      ctx.shadowColor = hsla(hue, 100, 65, 1);
+      ctx.shadowColor = alert ? red(60, 1) : col(th, 100, 65, 1);
       ctx.shadowBlur = R * 0.06;
-      ctx.fillStyle = hsla(hue, 100, 90, 1);
-      ctx.beginPath(); ctx.arc(hx, hy, gw * (0.62 + 0.12 * Math.sin(t * 6)), 0, TAU); ctx.fill();
+      ctx.fillStyle = alert ? "hsla(0,100%,88%,1)" : col(th, 100, 90, 1);
+      ctx.beginPath(); ctx.arc(hx, hy, gw * (alert ? 0.75 + 0.2 * Math.sin(t * 6) : 0.62), 0, TAU); ctx.fill();
       ctx.shadowBlur = 0;
     }
+  }
 
-    // 3. Cœur lumineux (pulsation = charge)
-    var pulse = Math.min(1.6, 0.5 + 0.5 * Math.sin(t * (1.8 + load * 5)) + anim.burst * 0.8) * easeOut(anim.boot);
-    var rc = R * (0.65 + 0.012 * pulse);
+  // 2b. GPU (droite) : arc segmenté en blocs, tête en losange
+  function drawArcGpu(b) {
+    var th = GPU_TINT, side = -1, rg = R * RG, gw = R * GW, frac = arcGpu;
+    var alert = calm.gpu >= CONFIG.gpuAlert;
+    var NB = 18, bgap = 0.018, lw = Math.max(2, R * 0.004);
+    var pulse = 0.5 + 0.5 * Math.sin(t * 6);
+    drawTrackLines(th, side, b);
+    for (var k = 0; k < NB; k++) {
+      var f0 = k / NB, f1 = (k + 1) / NB;
+      var a1 = angleOf(side, f0) - side * bgap / 2, a2 = angleOf(side, f1) + side * bgap / 2;
+      var lo = Math.min(a1, a2), hi = Math.max(a1, a2);
+      var fill = clamp(frac * NB - k, 0, 1);
+      var ghost = clamp(peak.gpu * NB - k, 0, 1) - fill;
+      sector(rg - gw / 2, rg + gw / 2, lo, hi);
+      ctx.strokeStyle = col(th, 90, 60, 0.20 * b); ctx.lineWidth = lw; ctx.stroke();
+      if (fill > 0) {
+        var rel = frac > 0 ? (k + 0.5) / (frac * NB) : 0;    // plus lumineux vers la tête
+        sector(rg - gw, rg + gw, lo, hi);
+        ctx.fillStyle = col(th, 100, 60, 0.10 * fill); ctx.fill();
+        sector(rg - gw / 2, rg + gw / 2, lo, hi);
+        ctx.fillStyle = alert ? red(lerp(45, 65, rel), (0.55 + 0.4 * pulse) * fill)
+                              : col(th, 100, lerp(46, 76, clamp(rel, 0, 1)), 0.95 * fill);
+        ctx.fill();
+      } else if (ghost > 0.02) {
+        sector(rg - gw / 2, rg + gw / 2, lo, hi);
+        ctx.fillStyle = col(th, 100, 70, 0.22 * ghost * b); ctx.fill();
+      }
+    }
+    if (frac > 0.003) {
+      var aEnd = angleOf(side, frac);
+      var hx = cx + Math.cos(aEnd) * rg, hy = cy + Math.sin(aEnd) * rg;
+      var sz = gw * (alert ? 0.85 + 0.2 * Math.sin(t * 6) : 0.75);
+      ctx.save();
+      ctx.translate(hx, hy); ctx.rotate(aEnd + Math.PI / 4);
+      ctx.shadowColor = alert ? red(60, 1) : col(th, 100, 65, 1);
+      ctx.shadowBlur = R * 0.06;
+      ctx.fillStyle = alert ? "hsla(0,100%,88%,1)" : col(th, 100, 90, 1);
+      ctx.fillRect(-sz / 2, -sz / 2, sz, sz);
+      ctx.restore();
+    }
+  }
+
+  // 3. Cœur sombre, halo sur le bord
+  function drawCore(th, load, b) {
+    var pulse = (0.5 + 0.5 * Math.sin(t * (1.5 + load * 3))) * b;
+    var rc = R * 0.65;
     var core = ctx.createRadialGradient(cx, cy, 0, cx, cy, rc);
-    core.addColorStop(0, hsla(hue, 100, 50, 0.04 + 0.03 * pulse));
-    core.addColorStop(0.7, hsla(hue, 100, 50, 0.05 + 0.04 * pulse));
-    core.addColorStop(0.93, hsla(hue, 100, 60, 0.22 + 0.14 * pulse));
-    core.addColorStop(1, hsla(hue, 100, 60, 0));
+    core.addColorStop(0, col(th, 100, 50, 0.02));
+    core.addColorStop(0.75, col(th, 100, 50, 0.03 + 0.02 * pulse));
+    core.addColorStop(0.94, col(th, 100, 60, 0.18 + 0.12 * pulse));
+    core.addColorStop(1, col(th, 100, 60, 0));
     ctx.fillStyle = core;
     ctx.beginPath(); ctx.arc(cx, cy, rc, 0, TAU); ctx.fill();
-
-    ctx.shadowColor = hsla(hue, 100, 65, 1);
-    ctx.shadowBlur = R * 0.06;
-    ctx.strokeStyle = hsla(hue, 100, 78, 0.85);
-    ctx.lineWidth = Math.max(1.5, R * 0.01);
+    ctx.shadowColor = col(th, 100, 65, 1);
+    ctx.shadowBlur = R * 0.05;
+    ctx.strokeStyle = col(th, 100, 78, 0.85 * b);
+    ctx.lineWidth = Math.max(2, R * 0.01);
     ctx.beginPath(); ctx.arc(cx, cy, R * 0.635, 0, TAU); ctx.stroke();
     ctx.shadowBlur = 0;
+  }
 
-    // 4. Rotation du cœur : sens horaire = monte, antihoraire = descend, quasi immobile = stable
-    var rk = R * 0.595, bootC = easeOut(anim.boot);
-    ctx.strokeStyle = hsla(hue, 100, 70, 0.14 * bootC);          // fines graduations qui tournent avec
-    ctx.lineWidth = Math.max(1, R * 0.006);
-    for (var gi = 0; gi < 72; gi++) {
-      var ga = coreRot + gi * TAU / 72, gl = gi % 6 === 0 ? 0.03 : 0.015;
-      ctx.beginPath();
-      ctx.moveTo(cx + Math.cos(ga) * (rk - R * gl), cy + Math.sin(ga) * (rk - R * gl));
-      ctx.lineTo(cx + Math.cos(ga) * (rk + R * gl), cy + Math.sin(ga) * (rk + R * gl));
-      ctx.stroke();
-    }
-    var tail = 0.12 + 0.8 * Math.abs(coreDir), sgn = coreDir >= 0 ? 1 : -1;
-    for (var ci = 0; ci < 3; ci++) {                                // 3 comètes : la traînée indique le sens
-      var head = coreRot + ci * TAU / 3;
+  // 4. Comètes : sens horaire = le liquide chauffe, antihoraire = il refroidit
+  function drawComets(th, b) {
+    var rk = R * 0.59;
+    var tail = 0.15 + 0.85 * Math.abs(cometDir), sgn = cometDir >= 0 ? 1 : -1;
+    for (var ci = 0; ci < 3; ci++) {
+      var head = rotComets + ci * TAU / 3;
       for (var st = 0; st < 14; st++) {
-        var f = st / 13;
-        var aa = head - sgn * tail * f;
-        ctx.fillStyle = hsla(hue, 100, lerp(92, 60, f), (1 - f) * 0.9 * bootC);
+        var f = st / 13, aa = head - sgn * tail * f;
+        ctx.fillStyle = col(th, 100, lerp(92, 60, f), (1 - f) * 0.95 * b);
         ctx.beginPath();
-        ctx.arc(cx + Math.cos(aa) * rk, cy + Math.sin(aa) * rk, Math.max(0.8, R * 0.014 * (1 - f * 0.8)), 0, TAU);
+        ctx.arc(cx + Math.cos(aa) * rk, cy + Math.sin(aa) * rk, Math.max(1.5, R * 0.018 * (1 - f * 0.75)), 0, TAU);
         ctx.fill();
       }
     }
-
-    // 5. Étincelles
-    for (var sj = 0; sj < sparks.length; sj++) {
-      var spk = sparks[sj], fl = 1 - spk.life / spk.max;
-      var x1 = cx + Math.cos(spk.a) * R * spk.r, y1 = cy + Math.sin(spk.a) * R * spk.r;
-      var x2 = cx + Math.cos(spk.a) * R * (spk.r - 0.03), y2 = cy + Math.sin(spk.a) * R * (spk.r - 0.03);
-      ctx.strokeStyle = hsla(hue, 100, 85, 0.8 * fl);
-      ctx.lineWidth = Math.max(1, R * 0.007);
-      ctx.beginPath(); ctx.moveTo(x2, y2); ctx.lineTo(x1, y1); ctx.stroke();
-    }
-
-    // 7. Affichage central animé
-    drawCenter(hue);
-
-    ctx.restore();
   }
 
-  /* ---------- Affichage central ---------- */
-  // Compteur à rouleaux : chaque chiffre défile verticalement
-  function drawOdometer(v, x, y, size, color, glow) {
-    v = Math.max(0, v);
-    var n = Math.floor(v), f = v - n;
-    var str = String(n);
-    ctx.font = "300 " + size + "px " + FONT;
-    var cw = ctx.measureText("0").width * 0.92;
-    var h = size * 0.86;
-    var total = cw * str.length;
-    var x0 = x - total / 2;
+  // 6. Liquide (température) + heure, avec effet « vu à travers l'eau » sous la surface
+  function timeStrings() {
+    var d = new Date();
+    return [String(d.getHours()).padStart(2, "0"), String(d.getMinutes()).padStart(2, "0")];
+  }
+  function drawTime(c, alpha, tint) {
+    var hm = timeStrings(), size = R * 0.36;
+    c.textAlign = "center"; c.textBaseline = "middle";
+    c.font = "400 " + size + "px " + FONT;
+    c.fillStyle = tint ? col(GLACIER, 100, 80, alpha) : "rgba(255,255,255," + alpha + ")";
+    c.fillText(hm[0], cx, cy - R * 0.17);
+    c.font = "700 " + size + "px " + FONT;
+    c.fillStyle = tint ? col(GLACIER, 100, 86, alpha) : "rgba(255,255,255," + alpha + ")";
+    c.fillText(hm[1], cx, cy + R * 0.19);
+  }
+
+  // Heure « sous l'eau » : dessinée floutée dans une image à part, seulement quand elle change
+  var under = document.createElement("canvas"), uctx = under.getContext("2d"), underKey = "";
+  function fontReady() { return !!(document.fonts && document.fonts.check && document.fonts.check("700 20px Oxanium")); }
+  function renderUnder() {
+    var hm = timeStrings();
+    var key = hm.join(":") + "|" + canvas.width + "|" + fontReady();
+    if (key === underKey) return;
+    underKey = key;
+    under.width = canvas.width; under.height = canvas.height;
+    uctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    uctx.clearRect(0, 0, S, S);
+    if ("filter" in uctx) uctx.filter = "blur(" + (R * 0.006).toFixed(2) + "px)";
+    drawTime(uctx, 1, true);
+    uctx.filter = "none";
+  }
+
+  function drawLiquidAndTime(th, b) {
+    var alertL = calm.liq >= CONFIG.liquidAlert;
+    var pA = 0.5 + 0.5 * Math.sin(t * 6);
+    var sY = cy + surfaceAt(0) * R;
 
     ctx.save();
-    ctx.beginPath();
-    ctx.rect(x0 - cw, y - h * 0.5, total + cw * 2, h * 1.0);
+    ctx.beginPath(); ctx.arc(cx, cy, RC * R, 0, TAU); ctx.clip();
+
+    // a. corps du liquide
+    surfacePath(true);
+    var lg = ctx.createLinearGradient(0, sY - R * 0.03, 0, cy + RC * R);
+    lg.addColorStop(0, alertL ? red(55, 0.20 + 0.12 * pA) : col(th, 100, 62, 0.20 * b));
+    lg.addColorStop(1, alertL ? red(35, 0.10) : col(th, 100, 45, 0.07 * b));
+    ctx.fillStyle = lg;
+    ctx.fill();
+
+    // b. heure au-dessus de la surface : nette
+    ctx.save();
+    surfacePath(false);
+    ctx.lineTo(cx + RC * R, cy - R); ctx.lineTo(cx - RC * R, cy - R); ctx.closePath();
     ctx.clip();
-    ctx.fillStyle = color;
-    ctx.shadowColor = glow;
-    ctx.shadowBlur = size * 0.12;
-    var carry = f;                       // le rouleau des unités tourne avec la fraction
-    for (var i = str.length - 1; i >= 0; i--) {
-      var d = +str[i];
-      var roll = easeInOut(carry);
-      var dx = x0 + cw * (i + 0.5);
-      var off = roll * h;
-      ctx.globalAlpha = 1 - roll;
-      ctx.fillText(String(d), dx, y - off);
-      if (roll > 0.001) {
-        ctx.globalAlpha = roll;
-        ctx.fillText(String((d + 1) % 10), dx, y + h - off);
-      }
-      carry = d === 9 ? carry : 0;       // la dizaine ne tourne que si l'unité passe de 9 à 0
+    ctx.shadowColor = col(th, 100, 50, 0.9); ctx.shadowBlur = R * 0.05;
+    drawTime(ctx, b, false);
+    ctx.restore();
+
+    // c. heure sous la surface : floutée et légèrement ondulée, comme vue à travers l'eau
+    renderUnder();
+    ctx.save();
+    surfacePath(true);
+    ctx.clip();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);          // on travaille en pixels réels
+    ctx.globalAlpha = 0.8 * b;
+    var top = Math.floor(Math.max(sY - R * 0.05, cy - R * 0.42) * DPR);
+    var bottom = Math.ceil((cy + R * 0.42) * DPR);
+    var band = Math.max(2, Math.round(2 * DPR));
+    var W = under.width;
+    for (var y = top; y < bottom; y += band) {
+      var yc = y / DPR;
+      var off = ((0.004 + 0.006 * agi) * R * Math.sin(yc * 0.045 + ph1 * 1.4) + (0.002 + 0.004 * agi) * R * Math.sin(yc * 0.11 - ph2 * 1.3)) * DPR;
+      ctx.drawImage(under, 0, y, W, band, off, y, W, band);
     }
-    if (carry > 0.001) {                 // 9 -> 10, 99 -> 100 : le « 1 » de tête apparaît
-      var rl = easeInOut(carry);
-      ctx.globalAlpha = rl;
-      ctx.fillText("1", x0 - cw * 0.5, y + h - rl * h);
+    ctx.globalAlpha = 1;
+    ctx.restore();
+
+    // d. reflets de la surface et bulles
+    ctx.globalCompositeOperation = "lighter";
+    var bubLw = Math.max(1.5, R * 0.004);
+    for (var i = 0; i < bubbles.length; i++) {
+      var bu = bubbles[i];
+      var bx = cx + (bu.x + bu.wob * Math.sin(bu.ph)) * R, by = cy + bu.y * R;
+      ctx.strokeStyle = col(th, 100, 85, 0.5 * b);
+      ctx.lineWidth = bubLw;
+      ctx.beginPath(); ctx.arc(bx, by, bu.r * R, 0, TAU); ctx.stroke();
+    }
+    for (var pi = 0; pi < pops.length; pi++) {            // ondes laissées par les bulles qui éclatent
+      var po = pops[pi], pf = po.life / po.max;
+      var px = cx + po.x * R, py = cy + surfaceAt(po.x) * R;
+      ctx.strokeStyle = col(th, 100, 88, 0.6 * (1 - pf) * b);
+      ctx.lineWidth = bubLw;
+      ctx.beginPath(); ctx.ellipse(px, py, (po.r + 0.03 * pf) * R, (po.r * 0.4 + 0.008 * pf) * R, 0, 0, TAU); ctx.stroke();
+    }
+    surfacePath(false);
+    ctx.shadowColor = alertL ? red(60, 1) : col(th, 100, 65, 1);
+    ctx.shadowBlur = R * 0.04;
+    ctx.strokeStyle = alertL ? red(70, 0.6 + 0.4 * pA) : col(th, 100, 85, 0.75 * b);
+    ctx.lineWidth = Math.max(2.5, R * 0.009);
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    for (var dk = 0; dk < drops.length; dk++) {           // gouttelettes au-dessus de la surface
+      var dd = drops[dk];
+      ctx.fillStyle = alertL ? red(75, 0.8) : col(th, 100, 88, 0.8 * b);
+      ctx.beginPath(); ctx.arc(cx + dd.x * R, cy + dd.y * R, Math.max(2, dd.r * R), 0, TAU); ctx.fill();
     }
     ctx.restore();
-    return total;
-  }
-
-  function drawCenter(hue) {
-    var m = METRICS[anim.idx];
-    var p = easeInOut(anim.since / 0.7);       // progression de la transition
-    var boot = easeOut((anim.boot - 0.35) / 0.65);
-    var light = hsla(hue, 80, 84, 0.9);
-    var glow = hsla(hue, 100, 50, 0.9);
-
-    ctx.globalCompositeOperation = "source-over";
-    ctx.textAlign = "center";
-    ctx.textBaseline = "middle";
-
-    // En haut : l'heure (les deux-points clignotent doucement)
-    var d = new Date();
-    var hh = String(d.getHours()).padStart(2, "0"), mm = String(d.getMinutes()).padStart(2, "0");
-    var ty = cy - R * 0.33, tsize = R * 0.105;
-    ctx.shadowColor = glow; ctx.shadowBlur = R * 0.04;
-    ctx.globalAlpha = boot;
-    ctx.font = "400 " + tsize + "px " + FONT;
-    var colonW = ctx.measureText(":").width;
-    ctx.textAlign = "right";
-    text(hh, cx - colonW * 0.7, ty, tsize, 400, light, R * 0.01);
-    ctx.textAlign = "left";
-    text(mm, cx + colonW * 0.7, ty, tsize, 400, light, R * 0.01);
-    ctx.textAlign = "center";
-    ctx.globalAlpha = boot * (0.35 + 0.65 * (0.5 + 0.5 * Math.cos(d.getMilliseconds() / 1000 * TAU)));
-    text(":", cx, ty - tsize * 0.06, tsize, 400, light, 0);
-    ctx.globalAlpha = 1;
-
-    // Nombre : compteur à rouleaux
-    var size = R * 0.5;
-    var numY = cy + R * 0.02;
-    ctx.globalAlpha = boot;
-    var w = drawOdometer(anim.shown, cx - R * 0.04, numY, size, "#ffffff", glow);
-
-    // Unité (° ou %) en fondu enchaîné
-    var ux = cx - R * 0.04 + w / 2 + R * 0.1;
-    var units = [{ u: m.unit, a: anim.prev >= 0 ? p : 1 }];
-    if (anim.prev >= 0 && p < 1 && METRICS[anim.prev].unit !== m.unit) units.push({ u: METRICS[anim.prev].unit, a: 1 - p });
-    else units[0].a = 1;
-    for (var i = 0; i < units.length; i++) {
-      var isDeg = units[i].u === "°";
-      ctx.globalAlpha = units[i].a * boot;
-      text(units[i].u, ux, isDeg ? numY - size * 0.24 : numY + size * 0.1,
-           isDeg ? size * 0.4 : size * 0.26, 300, hsla(hue, 80, 85, 0.95), 0);
-    }
-
-    // En bas : le composant (fondu avec léger glissement)
-    var ly = cy + R * 0.33, slide = R * 0.08;
-    var pp = anim.prev >= 0 ? p : 1;
-    ctx.shadowColor = glow; ctx.shadowBlur = R * 0.04;
-    if (anim.prev >= 0 && p < 1) {
-      ctx.globalAlpha = (1 - p) * boot;
-      text(METRICS[anim.prev].label, cx, ly + slide * p * 0.6, R * 0.095, 500, light, R * 0.03);
-    }
-    ctx.globalAlpha = pp * boot;
-    text(m.label, cx, ly + slide * 0.6 * (1 - pp), R * 0.095, 500, light, R * 0.03 * (2 - boot));
-    ctx.globalAlpha = 1;
-
-    // Indicateur : une pastille par valeur, l'active s'allonge
-    var dotsY = cy + R * 0.455, gapD = R * 0.05, dot = R * 0.015;
-    var widths = [], sum = 0;
-    for (var k = 0; k < METRICS.length; k++) {
-      var act = k === anim.idx ? (anim.prev >= 0 ? p : 1) : (k === anim.prev ? 1 - p : 0);
-      widths.push({ w: dot * 2 + act * R * 0.045, a: act });
-      sum += widths[k].w;
-    }
-    var dxp = cx - (sum + gapD * (METRICS.length - 1)) / 2;
-    ctx.shadowBlur = R * 0.03;
-    for (k = 0; k < METRICS.length; k++) {
-      ctx.globalAlpha = boot;
-      ctx.fillStyle = hsla(hue, 100, lerp(45, 80, widths[k].a), 0.35 + 0.65 * widths[k].a);
-      ctx.beginPath();
-      if (ctx.roundRect) ctx.roundRect(dxp, dotsY - dot, widths[k].w, dot * 2, dot);
-      else ctx.rect(dxp, dotsY - dot, widths[k].w, dot * 2);
-      ctx.fill();
-      dxp += widths[k].w + gapD;
-    }
-
-    if (!state.live) {
-      ctx.globalAlpha = 0.35 * boot;
-      text("DÉMO", cx, cy - R * 0.47, R * 0.04, 600, "#ffffff", R * 0.02);
-    }
-    ctx.globalAlpha = 1;
-    ctx.shadowBlur = 0;
   }
 
   requestAnimationFrame(frame);
