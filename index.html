@@ -39,16 +39,18 @@
       [1.00, 360, 0.00]
     ],
     defaultFps: 30,
-    cycleSeconds: 6     // durée d'affichage de chaque valeur
+    cycleSeconds: 6,    // durée d'affichage de chaque valeur
+    sparks: true        // étincelles qui jaillissent du cœur selon la charge CPU (false pour les retirer)
   };
 
   // Valeurs affichées tour à tour au centre (min/max = échelle de la jauge)
   var METRICS = [
-    { key: "load",    label: "CPU",     unit: "%", min: 0,  max: 100 },
-    { key: "gpuLoad", label: "GPU",     unit: "%", min: 0,  max: 100 },
-    { key: "liq",     label: "LIQUIDE", unit: "°", min: 25, max: 55 }
-    // Pour ajouter les températures : { key: "cpu", label: "CPU", unit: "°", min: 20, max: 95 }
-    //                                  { key: "gpu", label: "GPU", unit: "°", min: 20, max: 90 }
+    // trend = écart (°C) à partir duquel on considère que la valeur monte ou descend nettement
+    { key: "cpu", label: "CPU",     unit: "°", min: 20, max: 90, trend: 1.5 },
+    { key: "gpu", label: "GPU",     unit: "°", min: 20, max: 90, trend: 1.5 },
+    { key: "liq", label: "LIQUIDE", unit: "°", min: 25, max: 55, trend: 0.25 }
+    // Pour ajouter les charges : { key: "load",    label: "CPU", unit: "%", min: 0, max: 100 }
+    //                            { key: "gpuLoad", label: "GPU", unit: "%", min: 0, max: 100 }
   ];
 
   var params = new URLSearchParams(location.search);
@@ -57,6 +59,7 @@
   /* ---------- Données ---------- */
   var state = { cpu: 35, gpu: 35, liq: 28, load: 0.1, gpuLoad: 0.1, live: false };
   var disp  = { cpu: 35, gpu: 35, liq: 28, load: 0.1, gpuLoad: 0.1 };
+  var calm  = { cpu: 35, gpu: 35, liq: 28, load: 0.1, gpuLoad: 0.1 };   // valeurs lissées sur ~2,5 s pour le chiffre
   function metricValue(m, src) { return m.unit === "%" ? src[m.key] * 100 : src[m.key]; }
 
   // Animation de l'affichage central
@@ -179,6 +182,12 @@
   /* ---------- Animation ---------- */
   var t = 0, last = performance.now(), lastDraw = 0;
   var rotSeg = 0, rotDash = 0, wave = 0;
+  // Tendance : moyenne rapide (~3 s) comparée à une moyenne lente (~15 s)
+  var fast = { cpu: 0, gpu: 0, liq: 0, load: 0, gpuLoad: 0 };
+  var slow = { cpu: 0, gpu: 0, liq: 0, load: 0, gpuLoad: 0 };
+  var trendInit = false;
+  var coreDir = 0, coreRot = 0;          // -1 descend, 0 stable, +1 monte (lissé)
+  var sparks = [], sparkAcc = 0;
   var startTime = performance.now();
 
   function frame(now) {
@@ -211,7 +220,7 @@
 
     var heat = heatOf(disp.liq);
     var hue = hueOf(heat);
-    var load = Math.max(disp.load, disp.gpuLoad);   // vitesse des anneaux
+    var load = disp.load;   // vitesse des anneaux = charge CPU (la charge GPU de la RX 9070 reste souvent haute)
 
     rotSeg   += dt * (0.12 + load * 1.1);
     rotDash  -= dt * (0.25 + load * 1.6);
@@ -228,11 +237,37 @@
     }
     anim.burst = Math.max(0, anim.burst - dt * 1.4);
     var m = METRICS[anim.idx];
-    var target = Math.round(metricValue(m, state));
-    anim.shown += (target - anim.shown) * (1 - Math.exp(-dt * (anim.boot < 1 ? 2.2 : 4)));
+    var kc = 1 - Math.exp(-dt / 2.5);
+    for (var key in calm) calm[key] += (state[key] - calm[key]) * kc;
+    var target = Math.round(metricValue(m, calm));
+    anim.shown += (target - anim.shown) * (1 - Math.exp(-dt * (anim.boot < 1 ? 2.2 : 7)));
     if (Math.abs(target - anim.shown) < 0.003) anim.shown = target;
-    var gTarget = clamp((metricValue(m, disp) - m.min) / (m.max - m.min), 0, 1) * easeOut(anim.boot);
+    var gTarget = clamp((metricValue(m, calm) - m.min) / (m.max - m.min), 0, 1) * easeOut(anim.boot);
     anim.gauge += (gTarget - anim.gauge) * (1 - Math.exp(-dt * 3.5));
+
+    // Tendance de la valeur affichée -> sens de rotation du cœur
+    if (!trendInit) { for (var k0 in fast) { fast[k0] = slow[k0] = state[k0]; } trendInit = true; }
+    var kf = 1 - Math.exp(-dt / 3), ks = 1 - Math.exp(-dt / 15);
+    for (var k1 in fast) { fast[k1] += (state[k1] - fast[k1]) * kf; slow[k1] += (state[k1] - slow[k1]) * ks; }
+    var tr = m.unit === "%" ? (fast[m.key] - slow[m.key]) * 100 : fast[m.key] - slow[m.key];
+    var dirTarget = Math.tanh(tr / (m.trend || 1.5));
+    coreDir += (dirTarget - coreDir) * (1 - Math.exp(-dt / 1.2));   // inversion douce : ralentit, s'arrête, repart
+    coreRot += dt * coreDir * (0.9 + load * 1.2);
+
+    // Étincelles
+    if (CONFIG.sparks) {
+      sparkAcc += dt * load * 35 * easeOut(anim.boot);
+      while (sparkAcc >= 1 && sparks.length < 70) {
+        sparkAcc -= 1;
+        sparks.push({ a: Math.random() * TAU, r: 0.62, v: 0.18 + Math.random() * 0.25, life: 0, max: 0.6 + Math.random() * 0.7 });
+      }
+      if (sparkAcc > 1) sparkAcc = 0;
+      for (var si = sparks.length - 1; si >= 0; si--) {
+        var sp = sparks[si];
+        sp.life += dt; sp.r += sp.v * dt; sp.a += coreDir * dt * 0.4;
+        if (sp.life > sp.max || sp.r > 0.8) sparks.splice(si, 1);
+      }
+    }
 
     draw(hue, heat, load);
   }
@@ -246,8 +281,8 @@
 
     // Fond
     var bg = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
-    bg.addColorStop(0, hsla(hue, 70, 10, 1));
-    bg.addColorStop(0.55, hsla(hue, 60, 5, 1));
+    bg.addColorStop(0, hsla(hue, 60, 3, 1));
+    bg.addColorStop(0.55, hsla(hue, 50, 2.5, 1));
     bg.addColorStop(1, "#000");
     ctx.fillStyle = bg;
     ctx.fillRect(0, 0, S, S);
@@ -336,9 +371,9 @@
     var pulse = Math.min(1.6, 0.5 + 0.5 * Math.sin(t * (1.8 + load * 5)) + anim.burst * 0.8) * easeOut(anim.boot);
     var rc = R * (0.65 + 0.012 * pulse);
     var core = ctx.createRadialGradient(cx, cy, 0, cx, cy, rc);
-    core.addColorStop(0, hsla(hue, 100, 70, 0.26 + 0.10 * pulse));
-    core.addColorStop(0.6, hsla(hue, 100, 55, 0.13 + 0.07 * pulse));
-    core.addColorStop(0.93, hsla(hue, 100, 60, 0.28 + 0.15 * pulse));
+    core.addColorStop(0, hsla(hue, 100, 50, 0.04 + 0.03 * pulse));
+    core.addColorStop(0.7, hsla(hue, 100, 50, 0.05 + 0.04 * pulse));
+    core.addColorStop(0.93, hsla(hue, 100, 60, 0.22 + 0.14 * pulse));
     core.addColorStop(1, hsla(hue, 100, 60, 0));
     ctx.fillStyle = core;
     ctx.beginPath(); ctx.arc(cx, cy, rc, 0, TAU); ctx.fill();
@@ -349,6 +384,40 @@
     ctx.lineWidth = Math.max(1.5, R * 0.01);
     ctx.beginPath(); ctx.arc(cx, cy, R * 0.635, 0, TAU); ctx.stroke();
     ctx.shadowBlur = 0;
+
+    // 4. Rotation du cœur : sens horaire = monte, antihoraire = descend, quasi immobile = stable
+    var rk = R * 0.595, bootC = easeOut(anim.boot);
+    ctx.strokeStyle = hsla(hue, 100, 70, 0.14 * bootC);          // fines graduations qui tournent avec
+    ctx.lineWidth = Math.max(1, R * 0.006);
+    for (var gi = 0; gi < 72; gi++) {
+      var ga = coreRot + gi * TAU / 72, gl = gi % 6 === 0 ? 0.03 : 0.015;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(ga) * (rk - R * gl), cy + Math.sin(ga) * (rk - R * gl));
+      ctx.lineTo(cx + Math.cos(ga) * (rk + R * gl), cy + Math.sin(ga) * (rk + R * gl));
+      ctx.stroke();
+    }
+    var tail = 0.12 + 0.8 * Math.abs(coreDir), sgn = coreDir >= 0 ? 1 : -1;
+    for (var ci = 0; ci < 3; ci++) {                                // 3 comètes : la traînée indique le sens
+      var head = coreRot + ci * TAU / 3;
+      for (var st = 0; st < 14; st++) {
+        var f = st / 13;
+        var aa = head - sgn * tail * f;
+        ctx.fillStyle = hsla(hue, 100, lerp(92, 60, f), (1 - f) * 0.9 * bootC);
+        ctx.beginPath();
+        ctx.arc(cx + Math.cos(aa) * rk, cy + Math.sin(aa) * rk, Math.max(0.8, R * 0.014 * (1 - f * 0.8)), 0, TAU);
+        ctx.fill();
+      }
+    }
+
+    // 5. Étincelles
+    for (var sj = 0; sj < sparks.length; sj++) {
+      var spk = sparks[sj], fl = 1 - spk.life / spk.max;
+      var x1 = cx + Math.cos(spk.a) * R * spk.r, y1 = cy + Math.sin(spk.a) * R * spk.r;
+      var x2 = cx + Math.cos(spk.a) * R * (spk.r - 0.03), y2 = cy + Math.sin(spk.a) * R * (spk.r - 0.03);
+      ctx.strokeStyle = hsla(hue, 100, 85, 0.8 * fl);
+      ctx.lineWidth = Math.max(1, R * 0.007);
+      ctx.beginPath(); ctx.moveTo(x2, y2); ctx.lineTo(x1, y1); ctx.stroke();
+    }
 
     // 7. Affichage central animé
     drawCenter(hue);
@@ -388,6 +457,11 @@
         ctx.fillText(String((d + 1) % 10), dx, y + h - off);
       }
       carry = d === 9 ? carry : 0;       // la dizaine ne tourne que si l'unité passe de 9 à 0
+    }
+    if (carry > 0.001) {                 // 9 -> 10, 99 -> 100 : le « 1 » de tête apparaît
+      var rl = easeInOut(carry);
+      ctx.globalAlpha = rl;
+      ctx.fillText("1", x0 - cw * 0.5, y + h - rl * h);
     }
     ctx.restore();
     return total;
