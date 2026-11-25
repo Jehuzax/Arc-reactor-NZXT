@@ -32,8 +32,8 @@
     gpuIdlePower: 60,        // W : en dessous, l'eau est calme
     gpuMaxPower: 220,        // W : eau en pleine ébullition (RX 9070)
     ramRange: [10, 24],      // Go : anneau vide -> plein (32 Go au total)
-    lensCenter: 0.88,        // verre bombé : grossissement au centre (1 = aucun, 0.8 = fort)
-    lensEdge: 0.15,          // verre bombé : étirement vers les bords (0 = aucun, 0.25 = très fort)
+    lensCenter: 0.75,        // verre bombé : grossissement au centre (1 = aucun, 0.7 = très bombé)
+    lensEdge: 0.25,          // compression vers les bords (garder lensCenter + lensEdge = 1)
     lens: 0.20,              // (version de secours sans WebGL) étirement vers les bords
     defaultFps: 30
   };
@@ -509,8 +509,8 @@
     txt.width = canvas.width; txt.height = canvas.height;
     tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     tctx.clearRect(0, 0, S, S);
-    var size = R * 0.44;
-    var lines = [["400", hh, cy - R * 0.2], ["700", mm, cy + R * 0.21]];
+    var size = R * 0.38;
+    var lines = [["400", hh, cy - R * 0.175], ["700", mm, cy + R * 0.185]];
     tctx.textAlign = "center"; tctx.textBaseline = "middle";
     for (var pass = 0; pass < 3; pass++) {
       for (var i = 0; i < 2; i++) {
@@ -593,7 +593,7 @@
         "void main(){",
         "  vec2 p = (gl_FragCoord.xy - c) / jr; float r = length(p);",
         "  if (r > 1.0) { gl_FragColor = vec4(0.0); return; }",
-        "  float s = a - k * r * r;",                                  // grossi au centre, étiré vers les bords
+        "  float s = a + k * r * r;",                                  // dôme convexe : grossi au centre, resserré vers les bords
         "  vec2 sp = p * s;",
         "  float ca = 0.006 * r * r * r;",                             // irisation légère sur les bords
         "  vec4 cr = tx(c + sp * (1.0 + ca) * jr), cg = tx(c + sp * jr), cb = tx(c + sp * (1.0 - ca) * jr);",
