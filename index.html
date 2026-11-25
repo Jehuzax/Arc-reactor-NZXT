@@ -31,7 +31,7 @@
     gpuAlert: 85,
     gpuIdlePower: 60,        // W : en dessous, l'eau est calme
     gpuMaxPower: 220,        // W : eau en pleine ébullition (RX 9070)
-    ramRange: [10, 24],      // Go : anneau vide -> plein (32 Go au total)
+    ramRange: [4, 20],       // Go : anneau vide -> plein (32 Go au total, rarement plus de 20 utilisés)
     lensCenter: 0.75,        // verre bombé : grossissement au centre (1 = aucun, 0.7 = très bombé)
     lensEdge: 0.25,          // compression vers les bords (garder lensCenter + lensEdge = 1)
     lens: 0.20,              // (version de secours sans WebGL) étirement vers les bords
@@ -509,8 +509,8 @@
     txt.width = canvas.width; txt.height = canvas.height;
     tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     tctx.clearRect(0, 0, S, S);
-    var size = R * 0.38;
-    var lines = [["400", hh, cy - R * 0.175], ["700", mm, cy + R * 0.185]];
+    var size = R * 0.5;
+    var lines = [["400", hh, cy - R * 0.178], ["700", mm, cy + R * 0.19]];
     tctx.textAlign = "center"; tctx.textBaseline = "middle";
     for (var pass = 0; pass < 3; pass++) {
       for (var i = 0; i < 2; i++) {
